@@ -398,6 +398,14 @@ if step_idx < len(steps):
         verdict = last.get("verdict")
         if verdict == "correct":
             st.success(f"✓ {last.get('reason', 'Correcte')}")
+        elif verdict == "incomplete":
+            # Subconjunt correcte de l'esperat: ho mostrem com a info
+            # (no error). Combinem el reconeixement del que va bé amb
+            # la re-pregunta socràtica del judge per al que falta.
+            reason = last.get("reason", "") or ""
+            nq = last.get("next_question", "") or ""
+            text = f"{reason} {nq}".strip() or "Vas bé però falten elements del pas."
+            st.info(text)
         elif verdict in ("typical_error", "conceptual_gap"):
             label = last.get("error_label", "")
             raw_cat = PB.ERROR_CATALOG.get(label, "")
@@ -430,6 +438,7 @@ if history:
             verdict = turn.get("verdict", "")
             color = {
                 "correct": "green",
+                "incomplete": "blue",
                 "typical_error": "orange",
                 "conceptual_gap": "red",
                 "no_math": "purple",

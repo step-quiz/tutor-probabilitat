@@ -6,9 +6,13 @@ Visió general per a un lector nou
 Aquest mòdul aïlla tota la dependència amb Google Gemini. La resta del
 codi mai crida la SDK directament; sempre passa per aquestes 3 funcions:
 
-1. `judge_step(step, student_answer)` — avalua un pas de resolució de
-   l'alumne. Retorna un veredicte categòric (`correct` / `typical_error`
-   / `conceptual_gap`) + raó + etiqueta.
+1. `judge_step(step, student_answer, step_partials=None)` — avalua un pas
+   de resolució de l'alumne. Retorna un veredicte categòric (`correct` /
+   `incomplete` / `typical_error` / `conceptual_gap`) + raó + etiqueta +
+   (per a `incomplete`) `missing` i `next_question`. Les respostes
+   anteriors de l'alumne dins del mateix pas (`step_partials`) es
+   consideren per validar la unió cumulativa: un pas que demana N coses
+   pot tancar-se amb N torns parcials.
 
 2. `diagnose_dependency(step, student_answer, problem)` — quan
    `judge_step` ha marcat `conceptual_gap`, aquesta segona crida
@@ -389,17 +393,29 @@ def _extract_json(text: str) -> dict:
 # llegeixen amb `_loc(...)` que sempre retorna la versió catalana.
 
 _SYSTEM_JUDGE = """
-Ets un examinador estricte però just de problemes de probabilitat de batxillerat.
-Reps UN pas atòmic d'una resolució i UNA resposta de l'alumne.
-El pas pot ser raonament en text lliure, un càlcul numèric, o la identificació
-d'un espai mostral / succés. Accepta respostes informals i en català/castellà/anglès.
-Classifica la resposta en exactament una de:
-  "correct"         — matemàticament correcta (en raonament i/o resultat numèric)
-  "typical_error"   — errònia, i coincideix amb un error conegut per a aquest pas
-  "conceptual_gap"  — errònia d'una manera que revela un concepte prerequisit que falta
+Ets un examinador rigorós però pacient i dialogant de problemes de probabilitat de batxillerat.
+Reps UN pas atòmic d'una resolució i UNA resposta NOVA de l'alumne. Opcionalment reps també les
+respostes anteriors del mateix alumne dins d'aquest mateix pas: un pas pot demanar diverses coses
+alhora (per exemple: «defineix els successos i identifica les quatre probabilitats») i l'alumne
+respon en torns, no necessàriament tot a la primera.
+El pas pot ser raonament en text lliure, un càlcul numèric, o la identificació d'un espai mostral
+/ succés. Accepta respostes informals en català/castellà/anglès.
+
+Classifica la resposta NOVA tenint en compte la UNIÓ cumulativa amb les respostes anteriors,
+en exactament una de:
+  "correct"         — la unió cumulativa cobreix tot l'expected_summary i és matemàticament correcta.
+  "incomplete"      — el que ha escrit (sol o en unió cumulativa amb les respostes anteriors) és
+                      correcte i pertinent, però falten elements que el pas demana. La incompletud
+                      NO és un buit conceptual: l'alumne va bé però no ha acabat.
+  "typical_error"   — errònia, i coincideix amb un error conegut per a aquest pas.
+  "conceptual_gap"  — errònia d'una manera que revela un concepte prerequisit que falta.
+
+REGLA CLAU: si la resposta és un subconjunt correcte de l'esperada, marca "incomplete", NO
+"typical_error" ni "conceptual_gap". Identificar bé dues de quatre probabilitats és "incomplete",
+no un buit conceptual.
 
 Respon ÚNICAMENT amb JSON vàlid, sense preàmbul ni markdown:
-{"verdict": "...", "reason": "una frase en català", "error_label": "etiqueta o null"}
+{"verdict": "...", "reason": "una frase en català (què està bé, o què falla)", "error_label": "etiqueta o null", "missing": "què falta en una frase (només si verdict=incomplete), o null", "next_question": "re-pregunta socràtica curta dirigida només al que falta (només si verdict=incomplete, màxim una frase, sense LaTeX, en català), o null"}
 """
 
 _SYSTEM_DIAG = """
@@ -421,19 +437,30 @@ Escriu la pista en català.
 # ============================================================
 # Crida 1: jutjar pas de demostració
 # ============================================================
-def judge_step(step: dict, student_answer: str) -> dict:
+def judge_step(step: dict, student_answer: str,
+               step_partials: "list[str] | None" = None) -> dict:
     """
     Avalua una resposta de l'alumne a un pas concret d'un problema.
 
     Retorna un dict:
-      {"verdict": "correct" | "typical_error" | "conceptual_gap",
-       "reason": str,
-       "error_label": str | None}
+      {"verdict":       "correct" | "incomplete" | "typical_error" | "conceptual_gap",
+       "reason":        str,
+       "error_label":   str | None,
+       "missing":       str | None,   # només quan verdict == "incomplete"
+       "next_question": str | None}   # només quan verdict == "incomplete"
+
+    `step_partials` són respostes ANTERIORS del mateix alumne dins d'aquest
+    mateix pas, ja acceptades com a parcials en torns previs. El judge ha de
+    considerar la UNIÓ cumulativa, no jutjar la nova resposta aïlladament:
+    així una sèrie de respostes parcialment correctes pot tancar el pas amb
+    `correct` quan la unió cobreix tot l'expected_summary. Quan és None o
+    buida, el comportament és equivalent al d'abans (un sol torn).
 
     Si la IA retorna un veredicte fora del rang esperat, default a
     "typical_error" (millor un fals positiu d'error que un fals negatiu
     de "correct"; en cas d'injustícia, l'alumne tornarà a respondre amb
-    més detall i la IA reavaluarà).
+    més detall i la IA reavaluarà). NO defaulteggem a "incomplete" perquè
+    no avança el pas i pot induir bucles si el model està desorientat.
 
     Aquesta és l'ÚNICA crida del codi viu sense plan B determinista
     per als passos de tipus `free_text`. Per als passos `integer`,
@@ -441,6 +468,17 @@ def judge_step(step: dict, student_answer: str) -> dict:
     abans i només delega aquí com a fallback si l'input no parseja.
     """
     step_text = _loc(step['text'])
+    partials_block = ""
+    if step_partials:
+        # Renderem les respostes prèvies amb un guió, perquè el model les
+        # llegeixi com a entrades discretes i no les confongui amb la nova.
+        joined = "\n".join(f"  - {p}" for p in step_partials)
+        partials_block = (
+            "\nPrevious answers from the same student in THIS step "
+            "(already accepted as partial; use them for cumulative validation, "
+            "do NOT re-judge them individually):\n"
+            f"{joined}\n"
+        )
     user_msg = f"""
 Step presented to student:
   {step_text}
@@ -453,22 +491,26 @@ Key concepts this step exercises:
 
 Typical error for this step:
   {step['typical_error']} (label: {step['typical_error_label']})
-
-Student's answer:
+{partials_block}
+Student's new answer:
   {student_answer}
 
-Classify the student's answer.
+Classify the student's new answer considering the cumulative union with any previous answers.
 """
-    raw = _call_json(_SYSTEM_JUDGE, user_msg, max_tokens=200,
+    # max_tokens lleugerament ampliat (200 → 250) perquè els veredictes
+    # "incomplete" inclouen dos camps opcionals (missing, next_question).
+    raw = _call_json(_SYSTEM_JUDGE, user_msg, max_tokens=250,
                      function_name="judge_step")
     data = _extract_json(raw)
     verdict = data.get("verdict", "typical_error")
-    if verdict not in ("correct", "typical_error", "conceptual_gap"):
+    if verdict not in ("correct", "incomplete", "typical_error", "conceptual_gap"):
         verdict = "typical_error"
     return {
-        "verdict": verdict,
-        "reason": data.get("reason", ""),
-        "error_label": data.get("error_label"),
+        "verdict":       verdict,
+        "reason":        data.get("reason", ""),
+        "error_label":   data.get("error_label"),
+        "missing":       data.get("missing"),
+        "next_question": data.get("next_question"),
     }
 
 

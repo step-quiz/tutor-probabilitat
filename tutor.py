@@ -142,6 +142,14 @@ def new_session_state(problem_id: str) -> dict:
         # 1ª errada conceptual → prereq, 2ª → pista socràtica directa.
         # Es reseteja amb un pas correcte.
         "concept_failure_streak": {},
+        # Respostes parcials de l'alumne dins del pas ACTUAL, en ordre. Quan
+        # `judge_step` marca `incomplete` (la resposta és un subconjunt
+        # correcte de l'esperada), la guardem aquí i la passem al judge del
+        # proper torn perquè pugui validar la unió cumulativa. Es reseteja a
+        # `[]` quan el pas s'avança per un veredicte `correct`. NO es
+        # reseteja amb `typical_error` ni `conceptual_gap`: les parcials
+        # vàlides anteriors segueixen valent.
+        "step_partials":          [],
         # None mentre la sessió segueix. Valors finals possibles:
         # - "solved"             → tots els passos correctes
         # - "referred_to_tutor"  → MAX_BACKTRACK_DEPTH assolit
@@ -646,6 +654,17 @@ def process_turn(state: dict, raw_input: str) -> dict:
     # a la IA, que és el comportament heretat de tutor-grups.
     input_type = step.get("input_type", "free_text")
     reason = ""
+    # Camps només significatius quan verdict == "incomplete". Es queden
+    # a None per als veredictes deterministes i per als altres veredictes
+    # de la IA. Els recollim aquí, fora del try, per simplificar la branca
+    # de `incomplete` posterior.
+    next_question = None
+    missing = None
+    # Snapshot defensiu: passem una CÒPIA de les parcials, no la referència.
+    # Si no en fèssim còpia, l'`append` posterior a `state["step_partials"]`
+    # mutaria també l'objecte que el judge ja ha rebut (i el que el mock
+    # framework ha guardat a `call_args`, cosa que fa fallar tests).
+    partials = list(state["step_partials"]) if state.get("step_partials") else None
     try:
         if input_type == "integer":
             result = _check_integer(s, step.get("expected_value"))
@@ -655,10 +674,12 @@ def process_turn(state: dict, raw_input: str) -> dict:
                 verdict = "typical_error"
                 error_label = step.get("typical_error_label")
             else:
-                judgment = L.judge_step(step, s)
+                judgment = L.judge_step(step, s, partials)
                 verdict = judgment["verdict"]
                 reason = judgment.get("reason", "")
                 error_label = judgment.get("error_label")
+                next_question = judgment.get("next_question")
+                missing = judgment.get("missing")
 
         elif input_type in ("decimal", "fraction"):
             result = _check_numeric(s, step.get("expected_value"))
@@ -670,10 +691,12 @@ def process_turn(state: dict, raw_input: str) -> dict:
             else:
                 # Input no parsejable: pot ser raonament o un format
                 # inusual. Delegueu a la IA.
-                judgment = L.judge_step(step, s)
+                judgment = L.judge_step(step, s, partials)
                 verdict = judgment["verdict"]
                 reason = judgment.get("reason", "")
                 error_label = judgment.get("error_label")
+                next_question = judgment.get("next_question")
+                missing = judgment.get("missing")
 
         elif input_type == "set_listing":
             result = _check_set(s, step.get("expected_value"))
@@ -683,10 +706,12 @@ def process_turn(state: dict, raw_input: str) -> dict:
                 verdict = "typical_error"
                 error_label = step.get("typical_error_label")
             else:
-                judgment = L.judge_step(step, s)
+                judgment = L.judge_step(step, s, partials)
                 verdict = judgment["verdict"]
                 reason = judgment.get("reason", "")
                 error_label = judgment.get("error_label")
+                next_question = judgment.get("next_question")
+                missing = judgment.get("missing")
 
         else:
             # input_type == "free_text" o qualsevol altra cosa: IA.
@@ -695,10 +720,12 @@ def process_turn(state: dict, raw_input: str) -> dict:
             # bloquejat al pas actual. (Els retries automàtics de
             # `llm._call_with_retry` cobreixen errors transitoris; els
             # no-transitoris els capturem aquí.)
-            judgment = L.judge_step(step, s)
+            judgment = L.judge_step(step, s, partials)
             verdict = judgment["verdict"]
             reason = judgment.get("reason", "")
             error_label = judgment.get("error_label")
+            next_question = judgment.get("next_question")
+            missing = judgment.get("missing")
     except Exception as e:
         _push_msg(state, "warning", f"Error de connexió amb la IA: {e}")
         return state
@@ -714,6 +741,11 @@ def process_turn(state: dict, raw_input: str) -> dict:
         "reason":      reason,
         "ts":          time.time(),
     }
+    if verdict == "incomplete":
+        # Camps específics d'`incomplete`: útils al rastre del professor
+        # per veure on s'ha partit la conversa socràticament.
+        turn["missing"] = missing
+        turn["next_question"] = next_question
     state["history"].append(turn)
 
     if verdict == "correct":
@@ -721,12 +753,32 @@ def process_turn(state: dict, raw_input: str) -> dict:
         # `concept_failure_streak` es reseteja sencer (no només la clau
         # del concepte actual) perquè un pas correcte indica que l'alumne
         # està en bona forma; no té sentit arrossegar streaks antigues.
+        # `step_partials` també es reseteja: les parcials del pas anterior
+        # no valen per al següent.
         state["stagnation_consecutive"] = 0
         state["concept_failure_streak"] = {}
+        state["step_partials"] = []
         _push_msg(state, "feedback",
                   f"✓ Correcte. {reason}".strip())
         state["current_step_idx"] += 1
         return _maybe_finish(state)
+
+    if verdict == "incomplete":
+        # L'alumne ha respost bé però parcialment. Acumulem la resposta a
+        # `step_partials` perquè el judge del proper torn pugui validar la
+        # unió cumulativa. NO avancem el pas, NO incrementem stagnation, NO
+        # disparem `_handle_conceptual_gap`. Una conversa socràtica de
+        # diversos torns sobre el mateix pas és sana, no és bloqueig: el
+        # pas pot demanar 4 coses i l'alumne respondre-les en 2 o 3 torns.
+        state["step_partials"].append(s)
+        nq = (next_question or "").strip()
+        ack = (reason or "").strip()
+        if ack and nq:
+            text = f"{ack} {nq}"
+        else:
+            text = nq or ack or "Vas bé però et falta algun element. Continua amb el pas."
+        _push_msg(state, "feedback", text)
+        return state
 
     # --- Gestió d'errors ---
     state["stagnation_consecutive"] += 1
@@ -786,6 +838,14 @@ def build_trace(state: dict) -> dict:
         1 for t in state["history"]
         if t.get("type") == "step" and t.get("verdict") == "conceptual_gap"
     )
+    # Comptador de re-preguntes socràtiques per resposta parcial correcta.
+    # És una mètrica útil per al professor: si un pas concret acumula molts
+    # `incomplete_followups`, segurament està mal calibrat (demana massa
+    # coses alhora) i caldria partir-lo en passos més atòmics.
+    n_incomplete = sum(
+        1 for t in state["history"]
+        if t.get("type") == "step" and t.get("verdict") == "incomplete"
+    )
     return {
         "session_id":  state["session_id"],
         "problema": {
@@ -812,6 +872,7 @@ def build_trace(state: dict) -> dict:
             "total":         state["backtrack_count"],
             "profunditat":   state["backtrack_depth"],
         },
+        "incomplete_followups": n_incomplete,
         "nodes_consolidats":   state["nodes_consolidated"],
         "avisos_us_inadequat": state.get("inappropriate_warnings", 0),
         "veredicte_final":     state["verdict_final"] or "en_curs",
