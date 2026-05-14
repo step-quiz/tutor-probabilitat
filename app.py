@@ -193,11 +193,15 @@ if not _is_debug_mode():
           background-color: transparent !important;
           height: 2.5rem !important;
       }
-
-      /* Forcem el control de re-expansió del sidebar a quedar visible
-         per sobre del nostre header sticky (z-index alt) sempre que
-         el sidebar estigui plegat. */
-      [data-testid="stSidebarCollapsedControl"] {
+/* Streamlit <1.40 */
+      [data-testid="stSidebarCollapsedControl"],
+      /* Streamlit 1.40+ */
+      [data-testid="stSidebarCollapseButton"],
+      [data-testid="collapsedControl"],
+      /* Cobertura genèrica: qualsevol botó dins la zona del sidebar col·lapsat */
+      section[data-testid="stSidebarCollapsedControl"] button,
+      button[kind="headerNoPadding"],
+      [data-testid="stSidebarNav"] ~ * button {
           display: flex !important;
           visibility: visible !important;
           opacity: 1 !important;
