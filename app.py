@@ -114,6 +114,67 @@ st.markdown("""
       color: #ffffff !important;
       border: 2px solid #1d4ed8 !important;
   }
+
+  /* ========================================================
+     Sticky header: títol + enunciat sempre visibles al fer scroll
+     ========================================================
+     `st.container(key="enunciat_header")` afegeix al DOM una classe
+     `.st-key-enunciat_header`; la fem sticky perquè quedi enganxada
+     a dalt mentre l'alumne va baixant per veure els missatges i el
+     formulari del pas. Top = 2.5rem perquè quedi just per sota de la
+     barra superior nativa de Streamlit (que ara mantenim visible
+     perquè el control de re-expansió del sidebar viu allà).
+  */
+  .st-key-enunciat_header {
+      position: sticky;
+      top: 2.5rem;
+      background-color: white;
+      z-index: 50;
+      padding: 0.6rem 0.2rem;
+      border-bottom: 1px solid #e5e7eb;
+      margin-bottom: 0.75rem;
+  }
+
+  /* Títol del problema: ~40 % més petit que h2 (≈ 30px → ≈ 18px).
+     Substitueix l'antic `## {id} — {tema}` que era massa dominant. */
+  .enunciat-title {
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: #1f2937;
+      line-height: 1.35;
+      margin: 0;
+      padding: 0;
+  }
+
+  /* Botó-hamburger per amagar/mostrar el cos de l'enunciat. Compacte
+     i discret; viu a la mateixa filera que el títol. */
+  .st-key-enunciat_toggle button {
+      background-color: transparent !important;
+      color: #4a5568 !important;
+      border: 1px solid #cbd5e0 !important;
+      padding: 0.15rem 0.6rem !important;
+      min-height: auto !important;
+      font-size: 1.1rem !important;
+      line-height: 1 !important;
+  }
+  .st-key-enunciat_toggle button:hover {
+      background-color: #f3f4f6 !important;
+      color: #1f2937 !important;
+  }
+
+  /* Cos de l'enunciat quan està expandit. Estil discret per
+     diferenciar-lo del títol però sense competir amb el contingut
+     del pas actual a sota. */
+  .enunciat-body {
+      margin-top: 0.4rem;
+      padding-left: 0.75rem;
+      border-left: 3px solid #cbd5e0;
+      color: #4a5568;
+      font-size: 0.95rem;
+      line-height: 1.5;
+  }
+  .enunciat-body p { margin-bottom: 0.4rem; }
+  .enunciat-body p:last-child { margin-bottom: 0; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -122,8 +183,26 @@ if not _is_debug_mode():
     <style>
       [data-testid="stMainMenu"] { display: none !important; }
       [data-testid="stToolbar"]  { display: none !important; }
-      [data-testid="stHeader"]   { display: none !important; }
       footer                     { display: none !important; }
+
+      /* IMPORTANT: NO amaguem `stHeader` completament. Si ho fem,
+         el botó per re-expandir el sidebar (quan està plegat) també
+         desapareix i l'alumne queda atrapat sense menú lateral.
+         En comptes d'això, el fem transparent i compacte. */
+      [data-testid="stHeader"] {
+          background-color: transparent !important;
+          height: 2.5rem !important;
+      }
+
+      /* Forcem el control de re-expansió del sidebar a quedar visible
+         per sobre del nostre header sticky (z-index alt) sempre que
+         el sidebar estigui plegat. */
+      [data-testid="stSidebarCollapsedControl"] {
+          display: flex !important;
+          visibility: visible !important;
+          opacity: 1 !important;
+          z-index: 1000 !important;
+      }
     </style>
     """, unsafe_allow_html=True)
 
@@ -139,6 +218,12 @@ def init_state():
     # no recrea el widget si la clau no canvia).
     if "input_counter" not in st.session_state:
         st.session_state.input_counter = 0
+    # Si True, el cos de l'enunciat (no el títol) queda amagat al
+    # header sticky perquè l'alumne tingui més alçada útil. Es
+    # commuta amb el botó ☰. Default False: cal veure l'enunciat
+    # quan es comença un problema nou.
+    if "enunciat_collapsed" not in st.session_state:
+        st.session_state.enunciat_collapsed = False
     # Buffer de missatges pendents de mostrar (errors transitoris de
     # connexió, etc.) que han de sobreviure al `st.rerun()`.
     if "retry_messages" not in st.session_state:
@@ -201,9 +286,50 @@ if state is None:
 problem = state["problem"]
 verdict_final = state.get("verdict_final")
 
-st.markdown(f"## {problem['id']} — {_loc(problem['tema'])}")
-st.markdown(f"> {_loc(problem['enunciat'])}")
-st.divider()
+# ------------------------------------------------------------
+# Header sticky: títol + enunciat sempre presents al fer scroll.
+# ------------------------------------------------------------
+# Tres components dins del mateix contenidor:
+#   1. Títol compacte (custom CSS, ~40 % més petit que h2)
+#   2. Botó hamburger (☰) per amagar/mostrar el cos
+#   3. Cos de l'enunciat (només si no està collapsed)
+#
+# L'efecte sticky el dona el CSS de `.st-key-enunciat_header` definit
+# a l'stylesheet global més amunt. Streamlit injecta automàticament
+# aquesta classe al div del contenidor perquè li hem passat `key=`.
+with st.container(key="enunciat_header"):
+    col_title, col_toggle = st.columns([20, 1])
+    with col_title:
+        st.markdown(
+            f"<div class='enunciat-title'>"
+            f"{problem['id']} — {_loc(problem['tema'])}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    with col_toggle:
+        # Etiqueta del botó canvia segons l'estat: hamburger quan es
+        # pot collapsar, fletxa avall quan està collapsed (per
+        # indicar que es desplegarà).
+        toggle_label = "▾" if st.session_state.enunciat_collapsed else "☰"
+        toggle_help = (
+            "Mostra l'enunciat"
+            if st.session_state.enunciat_collapsed
+            else "Amaga l'enunciat per guanyar espai vertical"
+        )
+        if st.button(toggle_label, key="enunciat_toggle", help=toggle_help):
+            st.session_state.enunciat_collapsed = not st.session_state.enunciat_collapsed
+            st.rerun()
+
+    if not st.session_state.enunciat_collapsed:
+        # Renderitzem amb st.markdown per preservar el format del
+        # camp (negretes als marcadors **a)**, **b)**, etc.). El
+        # CSS `.enunciat-body` aplica la vora esquerra i el color
+        # discret. Tota la sortida queda dins del mateix contenidor
+        # sticky perquè es desplaci amb el títol.
+        st.markdown(
+            f"<div class='enunciat-body'>\n\n{_loc(problem['enunciat'])}\n\n</div>",
+            unsafe_allow_html=True,
+        )
 
 for msg in state.get("messages", []):
     kind = msg["kind"]
