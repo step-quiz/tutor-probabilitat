@@ -6,16 +6,20 @@ Visió general per a un lector nou
 Aquest mòdul aïlla tota la dependència amb Google Gemini. La resta del
 codi mai crida la SDK directament; sempre passa per aquestes 3 funcions:
 
-1. `judge_step(step, student_answer, lang)` — avalua un pas de
-   demostració de l'alumne. Retorna un veredicte categòric
-   (`correct` / `typical_error` / `conceptual_gap`) + raó + etiqueta.
+1. `judge_step(step, student_answer)` — avalua un pas de resolució de
+   l'alumne. Retorna un veredicte categòric (`correct` / `typical_error`
+   / `conceptual_gap`) + raó + etiqueta.
 
-2. `diagnose_dependency(step, student_answer, problem, lang)` — quan
+2. `diagnose_dependency(step, student_answer, problem)` — quan
    `judge_step` ha marcat `conceptual_gap`, aquesta segona crida
    identifica QUINA de les dependències del problema falta.
 
-3. `generate_hint(step, dep_id, lang)` — pista socràtica curta. Text
-   lliure (no JSON), màxim 2 frases, sense LaTeX.
+3. `generate_hint(step, dep_id)` — pista socràtica curta. Text lliure
+   (no JSON), màxim 2 frases, sense LaTeX.
+
+Tot el sistema treballa en català. Els prompts del sistema estan en
+català, i `_loc` (que llegeix camps bilingües de `problems.py`) sempre
+retorna l'entrada catalana.
 
 Quina és la diferència amb `tutor-eq/llm.py`?
 ---------------------------------------------
@@ -376,15 +380,15 @@ def _extract_json(text: str) -> dict:
 
 
 # ============================================================
-# Prompts bilingües
+# Prompts del sistema (català)
 # ============================================================
-# Cada prompt té dos variants (ca/en). El criteri és senzill: el prompt
-# va en la mateixa llengua que es vol rebre la resposta. NO usem la
-# convenció de tutor-eq (prompt en anglès, resposta en català) perquè
-# aquí els problemes ja contenen text bilingüe i és més senzill.
+# Tots els prompts del sistema són en català perquè volem que els
+# missatges generats per la IA (raons, justificacions, pistes)
+# arribin a l'alumne ja en català sense necessitat de cap traducció
+# post-hoc. Els camps `step["text"]` i `enunciat` dels problemes es
+# llegeixen amb `_loc(...)` que sempre retorna la versió catalana.
 
-_SYSTEM_JUDGE = {
-    "ca": """
+_SYSTEM_JUDGE = """
 Ets un examinador estricte però just de problemes de probabilitat de batxillerat.
 Reps UN pas atòmic d'una resolució i UNA resposta de l'alumne.
 El pas pot ser raonament en text lliure, un càlcul numèric, o la identificació
@@ -396,59 +400,28 @@ Classifica la resposta en exactament una de:
 
 Respon ÚNICAMENT amb JSON vàlid, sense preàmbul ni markdown:
 {"verdict": "...", "reason": "una frase en català", "error_label": "etiqueta o null"}
-""",
-    "en": """
-You are a strict but fair examiner of high-school probability problems.
-You receive ONE atomic step of a solution and ONE student answer.
-The step may be free-text reasoning, a numeric computation, or the identification
-of a sample space / event. Accept informal answers in Catalan/Spanish/English.
-Classify the answer into exactly one of:
-  "correct"         — mathematically sound (in reasoning and/or numeric result)
-  "typical_error"   — wrong, and matches a known error pattern for this step
-  "conceptual_gap"  — wrong in a way that reveals a missing prerequisite concept
+"""
 
-Respond ONLY with valid JSON, no preamble, no markdown:
-{"verdict": "...", "reason": "one sentence in English", "error_label": "label or null"}
-""",
-}
-
-_SYSTEM_DIAG = {
-    "ca": """
+_SYSTEM_DIAG = """
 Estàs diagnosticant quin concepte prerequisit de probabilitat li falta a un alumne.
 Reps un pas de resolució que ha fallat i la seva resposta errònia.
 De la llista de dependències del problema, retorna la UNA que probablement falta.
 Respon ÚNICAMENT amb JSON, sense preàmbul: {"dep_id": "...", "justification": "una frase"}
-""",
-    "en": """
-You are diagnosing which prerequisite probability concept a student is missing.
-You receive a solution step they failed and their wrong answer.
-From the list of the problem's dependencies, return the ONE that is most likely missing.
-Respond ONLY with JSON, no preamble: {"dep_id": "...", "justification": "one sentence"}
-""",
-}
+"""
 
-_SYSTEM_HINT = {
-    "ca": """
+_SYSTEM_HINT = """
 Ets un tutor socràtic de probabilitat per a alumnes de batxillerat (17 anys).
 L'alumne coneix el concepte però no l'aplica correctament.
 Dona UNA pista mínima que l'orienti cap a la resposta sense revelar-la.
 Màxim 2 frases. No facis servir LaTeX — usa matemàtiques ASCII o llenguatge planer.
 Escriu la pista en català.
-""",
-    "en": """
-You are a Socratic probability tutor for high-school students (age 17).
-The student knows the concept but is not applying it correctly.
-Give ONE minimal hint that leads them towards the answer without giving it away.
-Maximum 2 sentences. Do not use LaTeX — use ASCII math or plain language.
-Write the hint in English.
-""",
-}
+"""
 
 
 # ============================================================
 # Crida 1: jutjar pas de demostració
 # ============================================================
-def judge_step(step: dict, student_answer: str, lang: str = "ca") -> dict:
+def judge_step(step: dict, student_answer: str) -> dict:
     """
     Avalua una resposta de l'alumne a un pas concret d'un problema.
 
@@ -459,15 +432,15 @@ def judge_step(step: dict, student_answer: str, lang: str = "ca") -> dict:
 
     Si la IA retorna un veredicte fora del rang esperat, default a
     "typical_error" (millor un fals positiu d'error que un fals negatiu
-    de "correct" — l'alumne pot teclejar `!discrepància` si pensa que ho
-    té bé i seguim).
+    de "correct"; en cas d'injustícia, l'alumne tornarà a respondre amb
+    més detall i la IA reavaluarà).
 
-    Aquesta és l'ÚNICA crida del codi viu sense plan B determinista. Si
-    falla o respon malament, el sistema no té manera de detectar-ho.
-    Veure `TODO_DEFERRED.md §C7`.
+    Aquesta és l'ÚNICA crida del codi viu sense plan B determinista
+    per als passos de tipus `free_text`. Per als passos `integer`,
+    `decimal`, `fraction` i `set_listing`, `tutor._check_*` ja decideix
+    abans i només delega aquí com a fallback si l'input no parseja.
     """
-    system = _SYSTEM_JUDGE.get(lang, _SYSTEM_JUDGE["ca"])
-    step_text = _loc(step['text'], lang)
+    step_text = _loc(step['text'])
     user_msg = f"""
 Step presented to student:
   {step_text}
@@ -486,7 +459,8 @@ Student's answer:
 
 Classify the student's answer.
 """
-    raw = _call_json(system, user_msg, max_tokens=200, function_name="judge_step")
+    raw = _call_json(_SYSTEM_JUDGE, user_msg, max_tokens=200,
+                     function_name="judge_step")
     data = _extract_json(raw)
     verdict = data.get("verdict", "typical_error")
     if verdict not in ("correct", "typical_error", "conceptual_gap"):
@@ -501,8 +475,7 @@ Classify the student's answer.
 # ============================================================
 # Crida 2: diagnosticar dependència
 # ============================================================
-def diagnose_dependency(step: dict, student_answer: str, problem: dict,
-                        lang: str = "ca") -> str:
+def diagnose_dependency(step: dict, student_answer: str, problem: dict) -> str:
     """
     Quan `judge_step` ha marcat `conceptual_gap`, aquesta segona crida
     identifica QUINA dependència del problema està fallant.
@@ -515,20 +488,19 @@ def diagnose_dependency(step: dict, student_answer: str, problem: dict,
     `DEPENDENCIES`, retornem el primer de la llista del problema com a
     aproximació. Millor que None (que aturaria el retrocés).
     """
-    system = _SYSTEM_DIAG.get(lang, _SYSTEM_DIAG["ca"])
     deps_text = "\n".join(
-        f"  {dep_id}: {DEPENDENCIES[dep_id]['description']}"
+        f"  {dep_id}: {_loc(DEPENDENCIES[dep_id]['description'])}"
         for dep_id in problem.get("dependencies", [])
         if dep_id in DEPENDENCIES
     )
     user_msg = f"""
-Step: {_loc(step['text'], lang)}
+Step: {_loc(step['text'])}
 Student's wrong answer: {student_answer}
 Problem dependencies:
 {deps_text}
 Which single dependency is most likely missing?
 """
-    raw = _call_json(system, user_msg, max_tokens=150,
+    raw = _call_json(_SYSTEM_DIAG, user_msg, max_tokens=150,
                      function_name="diagnose_dependency")
     data = _extract_json(raw)
     dep_id = data.get("dep_id")
@@ -541,20 +513,26 @@ Which single dependency is most likely missing?
 # ============================================================
 # Crida 3: generar pista socràtica
 # ============================================================
-def generate_hint(step: dict, dep_id: str, lang: str = "ca") -> str:
+def generate_hint(step: dict, dep_id: str) -> str:
     """
     Pista socràtica curta per al pas actual, donat un concepte concret
     que l'alumne suposadament coneix però no està aplicant.
 
     Sortida en text lliure (no JSON). Es controla a través del prompt:
-    màxim 2 frases, sense LaTeX, llengua corresponent.
+    màxim 2 frases, sense LaTeX, en català.
+
+    Aquesta funció encara existeix tot i que no hi ha botó d'usuari per
+    sol·licitar pista: és cridada internament des de
+    `tutor._handle_conceptual_gap` quan el `_quick_keyword_check`
+    detecta que l'alumne coneix el concepte (i per tant cal una pista
+    en comptes d'un retrocés a prerequisit).
     """
-    system = _SYSTEM_HINT.get(lang, _SYSTEM_HINT["ca"])
-    dep_desc = DEPENDENCIES.get(dep_id, {}).get("description", dep_id)
+    dep_desc = _loc(DEPENDENCIES.get(dep_id, {}).get("description", dep_id))
     user_msg = f"""
 The student knows '{dep_desc}' but is not applying it.
-Step they are on: {_loc(step['text'], lang)}
+Step they are on: {_loc(step['text'])}
 Give one Socratic hint.
 """
-    raw = _call_text(system, user_msg, max_tokens=120, function_name="generate_hint")
+    raw = _call_text(_SYSTEM_HINT, user_msg, max_tokens=120,
+                     function_name="generate_hint")
     return raw.strip()

@@ -9,14 +9,18 @@ i llegeix l'estat retornat. Això permet provar la lògica amb scripts o
 amb tests sense aixecar la UI.
 
 L'estat de la sessió és un `dict` (no una classe) que es construeix amb
-`new_session_state(...)` i s'actualitza en cada torn amb
-`process_turn(state, raw_input, lang) → state`. L'esquema complet de
-l'estat està documentat a `SCHEMA.md`.
+`new_session_state(problem_id)` i s'actualitza en cada torn amb
+`process_turn(state, raw_input) → state`. L'esquema complet de l'estat
+està documentat a `SCHEMA.md`.
+
+La interfície és monolingüe (català). No hi ha cap paràmetre `lang`:
+tots els missatges generats per l'engine són en català, i els camps
+bilingües de `problems.py` s'aplanen via `PB.get_localized(field)` que
+sempre retorna la versió catalana.
 
 Components principals
 ---------------------
-- `process_turn` — punt d'entrada únic. Despatxa per tipus d'input i,
-  un cop dins del flux principal, per `step["input_type"]`.
+- `process_turn` — punt d'entrada únic. Despatxa per `step["input_type"]`.
 - `_check_numeric` / `_check_integer` / `_check_set` — verificadors
   deterministes per als passos `decimal`/`fraction`, `integer` i
   `set_listing`. Retornen `True`/`False` quan poden parsejar, o `None`
@@ -25,22 +29,24 @@ Components principals
   no-matemàtic (ús inadequat del sistema). Portat de `tutor-eq`.
 - `_handle_inappropriate` — comptador `inappropriate_warnings`. Al
   tercer avís, la sessió es marca `suspended`.
-- `_handle_hint_request` — quan l'alumne tecleja `?` demana pista.
 - `_handle_conceptual_gap` — quan la IA marca buit conceptual: decideix
   si toca retrocedir a un prerequisit o si ja s'ha esgotat el límit.
+  Si el `_quick_keyword_check` detecta que l'alumne coneix el concepte,
+  genera una pista proactiva (via `L.generate_hint`) en comptes de
+  retrocedir. Aquesta és l'única via per la qual es produeixen pistes
+  automàticament — no hi ha cap senyal d'usuari per demanar-ne.
 - `_process_prereq_turn` — quan estem dins d'una mini-sessió de
   prerequisit, avalua la resposta de manera determinista (keyword match).
 - `build_trace` / `serialize_trace` — generació del rastre JSON per al
   professor a la fi de la sessió.
 
-Senyals especials reconeguts a `raw_input`
-------------------------------------------
-- `?`           → demana pista per al pas actual.
-- `!text...`    → registra una discrepància («el sistema diu que estic
-                  equivocat però jo crec que tinc raó perquè...») i
-                  AVANÇA al següent pas sense avaluar. El professor pot
-                  revisar la discrepància al rastre JSON.
-- `!!`, `exit`, `:q` → tanca la sessió. `verdict_final = "abandoned"`.
+Senyals d'usuari
+----------------
+L'alumne envia text lliure. NO hi ha caràcters especials (`?`, `!`, `!!`).
+La sessió només acaba per camí natural: tots els passos correctes
+(`solved`), tres avisos d'ús inadequat (`suspended`), o
+`MAX_BACKTRACK_DEPTH` retrocessos a prerequisits sense desbloquejar
+(`referred_to_tutor`).
 
 Diferència principal amb `tutor-grups`
 --------------------------------------
@@ -48,6 +54,7 @@ Diferència principal amb `tutor-grups`
   amb verificació determinista via `fractions.Fraction`. Si l'input no
   parseja, es delega a `llm.judge_step` com a fallback.
 - Detecció determinista d'ús inadequat (portada de `tutor-eq`).
+- Monolingüe (català). Sense identificació de l'alumne.
 """
 
 import copy
@@ -82,26 +89,29 @@ MAX_INAPPROPRIATE_WARNINGS = 3
 # ============================================================
 # Construcció d'un estat nou
 # ============================================================
-def new_session_state(problem_id: str, student_id: str = "anon") -> dict:
+def new_session_state(problem_id: str) -> dict:
     """
     Estat inicial d'una sessió per a un problema concret.
 
-    `student_id`: pseudònim de l'alumne. Es propaga al context de logging
-    (`llm.set_log_context`) perquè totes les crides a l'API d'aquesta
-    sessió quedin marcades amb el mateix codi. Default "anon" perquè
-    qualsevol crida sense pseudònim explícit quedi marcada com a tal.
-
-    Cada crida genera un `session_id` nou (12 hex chars). Una sessió =
+    No es demana cap identificador de l'alumne: tot el sistema treballa
+    de manera anònima. Cada sessió queda marcada al log de l'API
+    només pel `session_id` (12 hex chars) generat aquí. Una sessió =
     un intent d'un problema, no la vida del procés Python.
 
     L'esquema complet del dict retornat està a `SCHEMA.md` §"Estat de sessió".
     """
     problem = PB.get_problem(problem_id)
     session_id = uuid.uuid4().hex[:12]
-    L.set_log_context(student_id=student_id, session_id=session_id)
+    # Propaguem el `session_id` al logger; `student_id=None` perquè
+    # l'alumne és anònim. `_current_student_id()` farà fallback a
+    # "anon" automàticament als logs de l'API.
+    L.set_log_context(student_id=None, session_id=session_id)
     return {
         "session_id":             session_id,
-        "student_id":             student_id,
+        # L'alumne és anònim per disseny. El camp es manté al dict per
+        # estabilitat de l'esquema (lectors externs del trace JSON
+        # poden esperar-lo); sempre val None.
+        "student_id":             None,
         "problem_id":             problem_id,
         "problem":                problem,
         "started_at":             datetime.now(timezone.utc).isoformat(),
@@ -113,9 +123,6 @@ def new_session_state(problem_id: str, student_id: str = "anon") -> dict:
         # dict {type, step_id, student, verdict, error_label, reason, ts}.
         # Es serialitza al rastre JSON.
         "history":                [],
-        # Posicions on l'alumne ha demanat `?`. Útil al rastre per detectar
-        # passos especialment costosos.
-        "hints_requested":        [],
         # Comptador d'errors consecutius (sense distingir tipus) per
         # detectar estancament. Actualment només s'usa de manera defensiva
         # (no dispara pista proactiva — això és el que fa tutor-eq amb
@@ -125,9 +132,6 @@ def new_session_state(problem_id: str, student_id: str = "anon") -> dict:
         # límit de profunditat).
         "backtrack_count":        0,   # nº total de retrocessos
         "backtrack_depth":        0,   # profunditat actual del retrocés
-        # Notes `!text...` que l'alumne ha registrat. Cada entrada té
-        # {step, text, pending_review, ts}.
-        "discrepancies":          [],
         # Si != None, estem dins d'una mini-sessió de prerequisit (PRE-XXX).
         # Tots els torns en aquest estat van a `_process_prereq_turn` en
         # lloc del flux normal d'avaluació de pas.
@@ -138,8 +142,10 @@ def new_session_state(problem_id: str, student_id: str = "anon") -> dict:
         # 1ª errada conceptual → prereq, 2ª → pista socràtica directa.
         # Es reseteja amb un pas correcte.
         "concept_failure_streak": {},
-        # None mentre la sessió segueix; "solved" / "abandoned" /
-        # "referred_to_tutor" quan acaba.
+        # None mentre la sessió segueix. Valors finals possibles:
+        # - "solved"             → tots els passos correctes
+        # - "referred_to_tutor"  → MAX_BACKTRACK_DEPTH assolit
+        # - "suspended"          → 3 avisos d'ús inadequat
         "verdict_final":          None,
         # Nodes del DAG que l'alumne ha consolidat (resolent el prereq
         # corresponent). Per al rastre i analítica futura del pilot.
@@ -175,7 +181,6 @@ def _push_msg(state, kind: str, text: str, persistent: bool = False):
       - "prereq"           → inici d'un mini-exercici de reforç
       - "prereq_resolved"  → feedback positiu de tancament de prereq (verd)
       - "prereq_failed"    → feedback negatiu de tancament de prereq (groc)
-      - "discrepancy"      → confirmació d'una nota `!text...`
 
     `persistent`: si True, sobreviu al reset de missatges del proper torn.
     S'usa per als feedbacks de tancament de prereq, perquè l'alumne segueixi
@@ -376,7 +381,7 @@ def _has_math_content(text: str) -> bool:
 # ============================================================
 # Subflux: ús inadequat
 # ============================================================
-def _handle_inappropriate(state: dict, raw_text: str, lang: str = "ca") -> dict:
+def _handle_inappropriate(state: dict, raw_text: str) -> dict:
     """
     Incrementa el comptador d'avisos d'ús inadequat. Al 3r avís
     (`MAX_INAPPROPRIATE_WARNINGS`), tanca la sessió amb veredicte
@@ -403,27 +408,22 @@ def _handle_inappropriate(state: dict, raw_text: str, lang: str = "ca") -> dict:
 
     if n >= MAX_INAPPROPRIATE_WARNINGS:
         state["verdict_final"] = "suspended"
-        msg = ("S'ha detectat un ús inadequat del sistema. La sessió es tanca "
-               "i el rastre queda registrat." if lang == "ca"
-               else "Inappropriate use of the system has been detected. The "
-                    "session is closed and the trace has been logged.")
-        _push_msg(state, "warning", msg)
+        _push_msg(state, "warning",
+                  "S'ha detectat un ús inadequat del sistema. "
+                  "La sessió es tanca i el rastre queda registrat.")
         return state
 
-    msg = (f"Avís {n}/{MAX_INAPPROPRIATE_WARNINGS}: la teva resposta no conté "
-           "contingut matemàtic. Recorda que pots demanar pista amb `?` o "
-           "sortir amb `!!`." if lang == "ca"
-           else f"Warning {n}/{MAX_INAPPROPRIATE_WARNINGS}: your answer "
-                "contains no mathematical content. You can request a hint "
-                "with `?` or exit with `!!`.")
-    _push_msg(state, "warning", msg)
+    _push_msg(state, "warning",
+              f"Avís {n}/{MAX_INAPPROPRIATE_WARNINGS}: la teva resposta "
+              "no conté contingut matemàtic. Respon al pas amb el càlcul "
+              "o el raonament que demana l'enunciat.")
     return state
 
 
 # ============================================================
 # Processar torn de prerequisit
 # ============================================================
-def _process_prereq_turn(state: dict, raw_text: str, lang: str = "ca") -> dict:
+def _process_prereq_turn(state: dict, raw_text: str) -> dict:
     """
     Flux quan estem dins d'un mini-exercici de prereq (`active_prereq` !=
     None). L'avaluació és DETERMINISTA (no crida a la IA): comprova si la
@@ -448,7 +448,7 @@ def _process_prereq_turn(state: dict, raw_text: str, lang: str = "ca") -> dict:
     has_forbidden = any(kw.lower() in s_low for kw in forbidden)
     correct = has_required and not has_forbidden
 
-    explanation = PB.get_localized(prereq.get("explanation", ""), lang)
+    explanation = PB.get_localized(prereq.get("explanation", ""))
     prereq_id = prereq.get("id", state["active_prereq"])
 
     # Sortim del mode prereq sigui quin sigui el resultat: l'alumne ha vist
@@ -458,15 +458,15 @@ def _process_prereq_turn(state: dict, raw_text: str, lang: str = "ca") -> dict:
     state["active_prereq_depth"] = max(0, state["active_prereq_depth"] - 1)
 
     if correct:
-        label_ok  = "correcte" if lang == "ca" else "correct"
-        label_now = "**Ara, aplica el que has après al problema principal.**" if lang == "ca" \
-                    else "**Now apply what you have learnt to the main problem.**"
         # `persistent=True`: el missatge sobreviu al reset del proper torn
         # perquè l'alumne segueixi tenint-lo a la vista mentre torna al
         # pas principal.
-        _push_msg(state, "prereq_resolved",
-                  f"Exercici {prereq_id}: {label_ok}. {explanation}\n\n{label_now}",
-                  persistent=True)
+        _push_msg(
+            state, "prereq_resolved",
+            f"Exercici {prereq_id}: correcte. {explanation}\n\n"
+            "**Ara, aplica el que has après al problema principal.**",
+            persistent=True,
+        )
         # Anotem el node del DAG com a "consolidat" per al rastre.
         dag_node = PB.DEPENDENCIES.get(
             prereq.get("concept", ""), {}
@@ -474,20 +474,19 @@ def _process_prereq_turn(state: dict, raw_text: str, lang: str = "ca") -> dict:
         if dag_node and dag_node not in state["nodes_consolidated"]:
             state["nodes_consolidated"].append(dag_node)
     else:
-        label_ko   = "no és correcte" if lang == "ca" else "incorrect"
-        label_cont = "**Continua intentant el problema principal.**" if lang == "ca" \
-                     else "**Keep working on the main problem.**"
-        _push_msg(state, "prereq_failed",
-                  f"Exercici {prereq_id}: {label_ko}. {explanation}\n\n{label_cont}",
-                  persistent=True)
+        _push_msg(
+            state, "prereq_failed",
+            f"Exercici {prereq_id}: no és correcte. {explanation}\n\n"
+            "**Continua intentant el problema principal.**",
+            persistent=True,
+        )
     return state
 
 
 # ============================================================
 # Gestionar buit conceptual
 # ============================================================
-def _handle_conceptual_gap(state: dict, step: dict, student_answer: str,
-                           lang: str = "ca") -> dict:
+def _handle_conceptual_gap(state: dict, step: dict, student_answer: str) -> dict:
     """
     La IA ha classificat la resposta com a `conceptual_gap`. Decideix què
     fer en funció de l'estat del retrocés i de la història de fallades.
@@ -504,7 +503,7 @@ def _handle_conceptual_gap(state: dict, step: dict, student_answer: str,
        el sistema reconeix que l'alumne necessita més suport del que pot
        oferir.
     """
-    dep_id = L.diagnose_dependency(step, student_answer, state["problem"], lang=lang)
+    dep_id = L.diagnose_dependency(step, student_answer, state["problem"])
     if dep_id is None:
         # Edge case: la IA no ha sabut identificar la dependència. Donem
         # un missatge genèric i no fem retrocés (millor un fals negatiu
@@ -521,9 +520,8 @@ def _handle_conceptual_gap(state: dict, step: dict, student_answer: str,
     # concepte (només falla en l'aplicació) o si ha fallat repetidament.
     if already_knows or streak >= 2:
         try:
-            hint = L.generate_hint(step, dep_id, lang=lang)
-            prefix = "Pista" if lang == "ca" else "Hint"
-            _push_msg(state, "hint", f"{prefix}: {hint}")
+            hint = L.generate_hint(step, dep_id)
+            _push_msg(state, "hint", f"Pista: {hint}")
         except Exception as e:
             _push_msg(state, "warning", f"Error de connexió amb la IA: {e}")
         return state
@@ -553,13 +551,11 @@ def _handle_conceptual_gap(state: dict, step: dict, student_answer: str,
     state["active_prereq_depth"] = state["backtrack_depth"] + 1
     state["backtrack_depth"] += 1
     state["backtrack_count"] += 1
-    dep_desc   = PB.get_localized(dep["description"], lang)
-    label_cons = "Cal consolidar abans un concepte" if lang == "ca" else "You need to consolidate a concept first"
-    label_ex   = "Exercici de reforç" if lang == "ca" else "Practice exercise"
-    prereq_q   = PB.get_localized(prereq["question"], lang)
+    dep_desc = PB.get_localized(dep["description"])
+    prereq_q = PB.get_localized(prereq["question"])
     _push_msg(state, "prereq",
-              f"{label_cons}: **{dep_desc}**.\n\n"
-              f"**{label_ex}:** {prereq_q}")
+              f"Cal consolidar abans un concepte: **{dep_desc}**.\n\n"
+              f"**Exercici de reforç:** {prereq_q}")
     return state
 
 
@@ -579,14 +575,23 @@ def _maybe_finish(state: dict) -> dict:
 # ============================================================
 # Processar torn principal
 # ============================================================
-def process_turn(state: dict, raw_input: str, lang: str = "ca") -> dict:
+def process_turn(state: dict, raw_input: str) -> dict:
     """
     Punt d'entrada únic. Modifica l'estat in-place i el retorna.
 
-    Despatxa per tipus d'input:
-      1. Senyals especials (`!!`, `?`, `!text`) → handlers dedicats.
-      2. Estem dins d'una sub-sessió de prereq → `_process_prereq_turn`.
-      3. Cas normal → crida `L.judge_step` i actua segons el veredicte.
+    Flux:
+      1. Estem dins d'una sub-sessió de prereq → `_process_prereq_turn`.
+      2. Input sense contingut matemàtic → `_handle_inappropriate`.
+      3. Despatx per `step["input_type"]`:
+         - `integer`/`decimal`/`fraction`/`set_listing` → verificador
+           determinista, amb fallback a `L.judge_step` si l'input no
+           parseja com a número.
+         - `free_text` (i qualsevol altre valor) → `L.judge_step` directe.
+
+    No hi ha senyals especials (`!!`, `?`, `!text`). L'alumne sempre
+    envia text que respon al pas. Pistes i retrocés a prerequisits
+    són exclusivament proactius, gestionats internament per
+    `_handle_conceptual_gap`.
 
     NOTA: fem `copy.deepcopy` perquè Streamlit pot rerunear arbitràriament
     i no volem que muteu l'estat anterior si això es queda penjat per
@@ -602,44 +607,11 @@ def process_turn(state: dict, raw_input: str, lang: str = "ca") -> dict:
 
     s = (raw_input or "").strip()
 
-    # --- Senyals d'escapament ---
-    if s in ("!!", "exit", ":q"):
-        state["verdict_final"] = "abandoned"
-        _push_msg(state, "system", "Sessió tancada per l'alumne. Rastre desat.")
-        return state
-
-    if s == "?":
-        return _handle_hint_request(state, lang=lang)
-
-    if s.startswith("!") and len(s) > 1:
-        # `!text...` = discrepància. L'alumne afirma que té raó tot i el
-        # veredicte del sistema. La nota queda registrada per a revisió
-        # del professor i el pas avança automàticament. Aquest mecanisme
-        # és clau perquè la IA pot equivocar-se i no volem que una
-        # classificació errònia bloquegi l'alumne.
-        payload = s[1:].strip()
-        state["discrepancies"].append({
-            "step": state["current_step_idx"],
-            "text": payload,
-            "pending_review": True,
-            "ts": time.time(),
-        })
-        state["history"].append({
-            "type": "discrepancy",
-            "step_id": state["current_step_idx"] + 1,
-            "text": payload,
-            "ts": time.time(),
-        })
-        _push_msg(state, "discrepancy",
-                  "D'acord, queda anotat per revisió del professor. Continuem.")
-        state["current_step_idx"] += 1
-        return _maybe_finish(state)
-
     # --- Sessió de prerequisit activa ---
     # Tots els torns dins d'un mini-exercici de reforç van per aquí, NO
     # pel flux normal d'avaluació de pas.
     if state["active_prereq"] is not None:
-        return _process_prereq_turn(state, s, lang=lang)
+        return _process_prereq_turn(state, s)
 
     # --- Detecció determinista d'ús inadequat ---
     # Si l'input no conté cap senyal de contingut matemàtic, NO gastem
@@ -647,7 +619,7 @@ def process_turn(state: dict, raw_input: str, lang: str = "ca") -> dict:
     # Aquesta heurística és la primera línia; la IA pot atrapar al
     # segon nivell respostes que semblen matemàtiques però buides.
     if not _has_math_content(s):
-        return _handle_inappropriate(state, s, lang=lang)
+        return _handle_inappropriate(state, s)
     # Si torna a haver-hi contingut matemàtic, oblidem avisos previs:
     # l'alumne ha tornat al carril correcte.
     state["inappropriate_warnings"] = 0
@@ -683,7 +655,7 @@ def process_turn(state: dict, raw_input: str, lang: str = "ca") -> dict:
                 verdict = "typical_error"
                 error_label = step.get("typical_error_label")
             else:
-                judgment = L.judge_step(step, s, lang=lang)
+                judgment = L.judge_step(step, s)
                 verdict = judgment["verdict"]
                 reason = judgment.get("reason", "")
                 error_label = judgment.get("error_label")
@@ -698,7 +670,7 @@ def process_turn(state: dict, raw_input: str, lang: str = "ca") -> dict:
             else:
                 # Input no parsejable: pot ser raonament o un format
                 # inusual. Delegueu a la IA.
-                judgment = L.judge_step(step, s, lang=lang)
+                judgment = L.judge_step(step, s)
                 verdict = judgment["verdict"]
                 reason = judgment.get("reason", "")
                 error_label = judgment.get("error_label")
@@ -711,7 +683,7 @@ def process_turn(state: dict, raw_input: str, lang: str = "ca") -> dict:
                 verdict = "typical_error"
                 error_label = step.get("typical_error_label")
             else:
-                judgment = L.judge_step(step, s, lang=lang)
+                judgment = L.judge_step(step, s)
                 verdict = judgment["verdict"]
                 reason = judgment.get("reason", "")
                 error_label = judgment.get("error_label")
@@ -723,7 +695,7 @@ def process_turn(state: dict, raw_input: str, lang: str = "ca") -> dict:
             # bloquejat al pas actual. (Els retries automàtics de
             # `llm._call_with_retry` cobreixen errors transitoris; els
             # no-transitoris els capturem aquí.)
-            judgment = L.judge_step(step, s, lang=lang)
+            judgment = L.judge_step(step, s)
             verdict = judgment["verdict"]
             reason = judgment.get("reason", "")
             error_label = judgment.get("error_label")
@@ -765,80 +737,16 @@ def process_turn(state: dict, raw_input: str, lang: str = "ca") -> dict:
         # condicionada").
         if reason:
             _push_msg(state, "feedback", reason)
-        return _handle_conceptual_gap(state, step, s, lang=lang)
+        return _handle_conceptual_gap(state, step, s)
 
     # verdict == "typical_error" (o qualsevol cosa inesperada):
     # mostrem el missatge del catàleg si en tenim, o si no, el motiu donat
     # per la IA, o un missatge genèric.
     raw_cat = PB.ERROR_CATALOG.get(error_label or "", "")
-    msg = PB.get_localized(raw_cat, lang) if raw_cat else (
-        reason or ("La resposta no és correcta. Revisa el pas." if lang == "ca"
-                   else "The answer is not correct. Review this step.")
+    msg = PB.get_localized(raw_cat) if raw_cat else (
+        reason or "La resposta no és correcta. Revisa el pas."
     )
     _push_msg(state, "feedback", msg)
-    return state
-
-
-# ============================================================
-# Subflux: pista contextualitzada per '?'
-# ============================================================
-def _handle_hint_request(state: dict, lang: str = "ca") -> dict:
-    """
-    L'alumne ha tecleja `?`. Donem una pista contextual:
-
-    - Si estem dins d'un prereq, mostrem la mateixa `explanation` que es
-      veurà al tancar-lo (no és revelador perquè ja és el contingut que
-      l'alumne veuria de totes maneres).
-    - Si estem al flux principal, demanem a la IA una pista socràtica
-      sobre la primera dependència del pas actual.
-
-    Limitació coneguda: agafem la "primera" dependència del pas, no la
-    més rellevant. Si un pas té múltiples `key_concepts`, la pista podria
-    no apuntar al concepte més útil per a l'alumne en aquell moment.
-    Veure `TODO_DEFERRED.md` per possibles millores.
-    """
-    if state["active_prereq"] is not None:
-        prereq = PB.get_prerequisite(state["active_prereq"])
-        hint_text = prereq.get("explanation", "Llegeix bé el que es demana.") if prereq else ""
-        _push_msg(state, "hint", hint_text)
-        state["hints_requested"].append({
-            "step_idx": state["current_step_idx"],
-            "context": "prerequisit",
-            "ts": time.time(),
-        })
-        return state
-
-    problem = state["problem"]
-    steps = problem["passos"]
-    if state["current_step_idx"] >= len(steps):
-        return state
-
-    step = steps[state["current_step_idx"]]
-
-    # Triem la primera dependència del pas actual que existeixi al graf
-    # com a context de la pista. (Si no en trobem cap, donem una pista
-    # fallback que llista tots els `key_concepts`.)
-    dep_id = None
-    for dep in step.get("key_concepts", []):
-        if dep in PB.DEPENDENCIES:
-            dep_id = dep
-            break
-
-    if dep_id:
-        try:
-            hint = L.generate_hint(step, dep_id, lang=lang)
-            _push_msg(state, "hint", hint)
-        except Exception as e:
-            _push_msg(state, "warning", f"Error de connexió amb la IA: {e}")
-    else:
-        _push_msg(state, "hint",
-                  f"Recorda la definició de: {step['key_concepts']}. Aplica-la al pas actual.")
-
-    state["hints_requested"].append({
-        "step_idx": state["current_step_idx"],
-        "context": "principal",
-        "ts": time.time(),
-    })
     return state
 
 
@@ -850,22 +758,35 @@ def build_trace(state: dict) -> dict:
     Genera el rastre serialitzable per al professor al final d'una sessió.
 
     Camps clau:
-    - `torns`: la història completa de classificacions de la IA + notes
-      `!text` registrades. Permet revisió posterior dels falsos positius
-      i negatius del classificador.
-    - `pistes`: nº i posicions on s'ha demanat `?`. Pas amb moltes
-      pistes = candidat a ajustament del problema.
+    - `torns`: la història completa de classificacions de la IA. Permet
+      revisió posterior dels falsos positius i negatius del classificador.
+    - `pistes`: nº de pistes proactives generades per l'engine quan
+      `_handle_conceptual_gap` ha detectat que l'alumne ja coneix el
+      concepte. (No hi ha pistes a petició: l'alumne no pot demanar-les.)
     - `retrocessos`: comptador de mini-exercicis de reforç activats.
       Indica buits conceptuals.
     - `nodes_consolidats`: nodes del DAG que l'alumne ha consolidat
       durant la sessió. Útil per analítica a nivell d'alumne (què sap
       ara que abans no) un cop tinguem múltiples sessions per alumne.
-    - `discrepancies`: notes `!text...` pendents de revisió manual.
+    - `avisos_us_inadequat`: nº d'avisos pre-IA per input sense
+      contingut matemàtic.
+
+    No incloem cap identificador de l'alumne (la sessió és anònima);
+    el `session_id` és suficient per correlacionar torns amb el log
+    de l'API.
     """
     duration = time.time() - state["started_at_ts"]
     problem = state["problem"]
+    # Comptem les pistes que apareixen al `messages` ja gravades a
+    # `history` indirectament: en aquest moment, l'únic camí que pot
+    # afegir-les és `_handle_conceptual_gap` → `L.generate_hint` →
+    # `_push_msg(kind="hint")`. No es queden al history, així que el
+    # comptador segueix derivat del fluxe de buit-conceptual al history.
+    n_hints = sum(
+        1 for t in state["history"]
+        if t.get("type") == "step" and t.get("verdict") == "conceptual_gap"
+    )
     return {
-        "alumne":      state["student_id"],
         "session_id":  state["session_id"],
         "problema": {
             "id":     state["problem_id"],
@@ -881,17 +802,19 @@ def build_trace(state: dict) -> dict:
         "pas_actual":    state["current_step_idx"],
         "torns":         state["history"],
         "pistes": {
-            "total":    len(state["hints_requested"]),
-            "posicions": state["hints_requested"],
+            # Comptador de pistes proactives. No hi ha "posicions" perquè
+            # les pistes proactives es generen al moment del buit conceptual
+            # i ja queden gravades a `torns` (com a torn amb verdict
+            # `conceptual_gap`).
+            "total": n_hints,
         },
         "retrocessos": {
             "total":         state["backtrack_count"],
             "profunditat":   state["backtrack_depth"],
         },
-        "nodes_consolidats": state["nodes_consolidated"],
-        "discrepancies":     state["discrepancies"],
+        "nodes_consolidats":   state["nodes_consolidated"],
         "avisos_us_inadequat": state.get("inappropriate_warnings", 0),
-        "veredicte_final":   state["verdict_final"] or "en_curs",
+        "veredicte_final":     state["verdict_final"] or "en_curs",
     }
 
 

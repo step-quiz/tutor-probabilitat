@@ -1,15 +1,21 @@
 """
-Tutor de Grups Algebraics — UI Streamlit.
+Tutor de Probabilitat — UI Streamlit.
 
 Per executar:
     export GEMINI_API_KEY=...
     streamlit run app.py
 
 Mode debug: afegeix ?debug=1 a la URL.
+
+Aquesta UI és monolingüe (català) i anònima:
+- No hi ha cap selector d'idioma.
+- L'alumne no s'identifica de cap manera (ni pseudònim).
+- No hi ha caràcters especials (`?`, `!`, `!!`): l'alumne només envia
+  text que respon al pas actual. Les pistes són proactives (les
+  decideix l'engine via `_handle_conceptual_gap`).
 """
 
 import os
-import uuid
 import streamlit as st
 
 import problems as PB
@@ -17,21 +23,20 @@ import tutor as T
 import llm as L
 import api_logger
 
-# Shorthand for localizing problem-data fields (tema, enunciat, step text)
+# Shorthand per aplanar els camps bilingües de problems.py (tema,
+# enunciat, text dels passos). Tot retorna sempre la versió catalana.
 _loc = PB.get_localized
 
 # ============================================================
-# Textos UI bilingües
+# Textos UI (català)
 # ============================================================
 _UI = {
-    "ca": {
-        "page_title":       "Tutor IA — Probabilitat",
-        "sidebar_title":    "🎲 Tutor Probabilitat",
-        "problem_label":    "Problema:",
-        "nickname_label":   "Pseudònim (opcional):",
-        "start_btn":        "▶ Iniciar problema",
-        "notation_title":   "📐 Convencions de notació",
-        "notation_table":   r"""
+    "page_title":       "Tutor IA — Probabilitat",
+    "sidebar_title":    "🎲 Tutor Probabilitat",
+    "problem_label":    "Problema:",
+    "start_btn":        "▶ Iniciar problema",
+    "notation_title":   "📐 Convencions de notació",
+    "notation_table":   r"""
 | Vols escriure | Escriu |
 |---|---|
 | P(A) probabilitat de A | `P(A)` |
@@ -44,80 +49,27 @@ _UI = {
 | Conjunt {HH, HT, TH} | `{HH, HT, TH}` |
 | Coeficient binomial C(n,k) | `C(n, k)` o `nCk` |
 """,
-        "signals_title":    "⌨️ Senyals especials",
-        "signals_body":     "- `?` → pista socràtica\n- `!text` → registrar discrepància i avançar\n- `!!` → sortir de la sessió",
-        "debug_caption":    "Mode debug actiu",
-        "cost_label":       "Cost estimat (USD)",
-        "calls_label":      "Crides OK / total",
-        "select_problem":   "Selecciona un problema al panell esquerre i clica **▶ Iniciar**.",
-        "prereq_title":     "### 🔁 Exercici de reforç previ",
-        "answer_label":     "La teva resposta:",
-        "submit_btn":       "Enviar ↵",
-        "hint_btn":         "? Pista",
-        "exit_btn":         "✕ Sortir",
-        "solved":           "🎉 Problema completat! Has resolt el problema pas a pas.",
-        "abandoned":        "Sessió tancada. Pots reiniciar quan vulguis.",
-        "referred":         "Et recomanem parlar amb el professor o assistir a una tutoria.",
-        "step_label":       "Pas {idx} de {total}",
-        "discrepancy_msg":  "Discrepància anotada. Pas avançat.",
-        "wrong_msg":        "Resposta no correcta.",
-        "history_title":    "📋 Historial ({n} torns)",
-        "history_student":  "*Alumne:*",
-        "debug_title":      "🔍 Estat intern (debug)",
-        "trace_title":      "Rastre JSON",
-        "lang_label":       "Idioma / Language:",
-        "send_label":       "Enviar",
-    },
-    "en": {
-        "page_title":       "AI Tutor — Probability",
-        "sidebar_title":    "🎲 Probability Tutor",
-        "problem_label":    "Problem:",
-        "nickname_label":   "Nickname (optional):",
-        "start_btn":        "▶ Start problem",
-        "notation_title":   "📐 Notation conventions",
-        "notation_table":   r"""
-| You want to write | Type |
-|---|---|
-| P(A) probability of A | `P(A)` |
-| P(A ∩ B) intersection | `P(A and B)` or `P(A^B)` |
-| P(A ∪ B) union | `P(A or B)` or `P(A v B)` |
-| P(A \| B) conditional | `P(A\|B)` |
-| Aᶜ complement | `A^c` or `not A` |
-| Fraction 3/4 | `3/4` |
-| Decimal 0.25 | `0.25` or `0,25` |
-| Set {HH, HT, TH} | `{HH, HT, TH}` |
-| Binomial coefficient C(n,k) | `C(n, k)` or `nCk` |
-""",
-        "signals_title":    "⌨️ Special signals",
-        "signals_body":     "- `?` → Socratic hint\n- `!text` → log discrepancy and advance\n- `!!` → exit session",
-        "debug_caption":    "Debug mode active",
-        "cost_label":       "Estimated cost (USD)",
-        "calls_label":      "OK calls / total",
-        "select_problem":   "Select a problem on the left panel and click **▶ Start**.",
-        "prereq_title":     "### 🔁 Prerequisite exercise",
-        "answer_label":     "Your answer:",
-        "submit_btn":       "Submit ↵",
-        "hint_btn":         "? Hint",
-        "exit_btn":         "✕ Exit",
-        "solved":           "🎉 Problem complete! You have solved the problem step by step.",
-        "abandoned":        "Session closed. You can restart whenever you like.",
-        "referred":         "We recommend speaking with your lecturer or attending a tutorial session.",
-        "step_label":       "Step {idx} of {total}",
-        "discrepancy_msg":  "Discrepancy logged. Step advanced.",
-        "wrong_msg":        "Incorrect answer.",
-        "history_title":    "📋 History ({n} turns)",
-        "history_student":  "*Student:*",
-        "debug_title":      "🔍 Internal state (debug)",
-        "trace_title":      "JSON trace",
-        "lang_label":       "Idioma / Language:",
-        "send_label":       "Submit",
-    },
+    "debug_caption":    "Mode debug actiu",
+    "cost_label":       "Cost estimat (USD)",
+    "calls_label":      "Crides OK / total",
+    "select_problem":   "Selecciona un problema al panell esquerre i clica **▶ Iniciar**.",
+    "prereq_title":     "### 🔁 Exercici de reforç previ",
+    "answer_label":     "La teva resposta:",
+    "submit_btn":       "Enviar ↵",
+    "solved":           "🎉 Problema completat! Has resolt el problema pas a pas.",
+    "referred":         "Et recomanem parlar amb el professor o assistir a una tutoria.",
+    "step_label":       "Pas {idx} de {total}",
+    "wrong_msg":        "Resposta no correcta.",
+    "history_title":    "📋 Historial ({n} torns)",
+    "history_student":  "*Alumne:*",
+    "debug_title":      "🔍 Estat intern (debug)",
+    "trace_title":      "Rastre JSON",
 }
 
 
 def _t(key: str) -> str:
-    lang = st.session_state.get("lang", "ca")
-    return _UI.get(lang, _UI["ca"]).get(key, key)
+    """Recupera un text d'interfície per clau. Sempre en català."""
+    return _UI.get(key, key)
 
 
 # ============================================================
@@ -151,16 +103,6 @@ st.markdown("""
   .step-gap      { border-left: 4px solid #f97316; padding-left: 0.6rem; }
   .step-discrep  { border-left: 4px solid #8b5cf6; padding-left: 0.6rem; }
 
-  .st-key-hint_btn button {
-      background-color: #f59e0b !important;
-      color: #ffffff !important;
-      border: 1px solid #d97706 !important;
-  }
-  .st-key-exit_btn button {
-      background-color: #4a4a4a !important;
-      color: #ffffff !important;
-      border: 1px solid #2d2d2d !important;
-  }
   .st-key-start_btn button {
       background-color: #bfdbfe !important;
       color: #1e3a5f !important;
@@ -190,16 +132,15 @@ if not _is_debug_mode():
 # Inicialització
 # ------------------------------------------------------------
 def init_state():
-    if "lang" not in st.session_state:
-        st.session_state.lang = "ca"
-    if "lang_chosen" not in st.session_state:
-        st.session_state.lang_chosen = False
+    # Estat de la sessió tutoria. None abans del primer "Iniciar problema".
     if "tutor_state" not in st.session_state:
         st.session_state.tutor_state = None
+    # Comptador per forçar el reset del text_area entre torns (Streamlit
+    # no recrea el widget si la clau no canvia).
     if "input_counter" not in st.session_state:
         st.session_state.input_counter = 0
-    if "student_id" not in st.session_state:
-        st.session_state.student_id = f"A{uuid.uuid4().hex[:6].upper()}"
+    # Buffer de missatges pendents de mostrar (errors transitoris de
+    # connexió, etc.) que han de sobreviure al `st.rerun()`.
     if "retry_messages" not in st.session_state:
         st.session_state.retry_messages = []
 
@@ -207,51 +148,16 @@ def init_state():
 init_state()
 
 # ------------------------------------------------------------
-# Pantalla de selecció d'idioma (primera visita)
-# ------------------------------------------------------------
-if not st.session_state.lang_chosen:
-    st.markdown("<br>" * 3, unsafe_allow_html=True)
-    col_c = st.columns([1, 2, 1])[1]
-    with col_c:
-        st.markdown("## 🎲 Tutor IA · Probabilitat")
-        st.markdown("---")
-        st.markdown("### Tria l'idioma / Choose language")
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("🇨🇦  Català", use_container_width=True):
-                st.session_state.lang = "ca"
-                st.session_state.lang_chosen = True
-                st.rerun()
-        with col2:
-            if st.button("🇬🇧  English", use_container_width=True):
-                st.session_state.lang = "en"
-                st.session_state.lang_chosen = True
-                st.rerun()
-    st.stop()
-
-# ------------------------------------------------------------
 # Sidebar
 # ------------------------------------------------------------
 with st.sidebar:
     st.title(_t("sidebar_title"))
 
-    # Canvi d'idioma (sempre disponible)
-    lang_options = {"ca": "🇨🇦 Català", "en": "🇬🇧 English"}
-    new_lang = st.selectbox(
-        _t("lang_label"),
-        options=list(lang_options.keys()),
-        format_func=lambda x: lang_options[x],
-        index=0 if st.session_state.lang == "ca" else 1,
-        key="lang_selector",
-    )
-    if new_lang != st.session_state.lang:
-        st.session_state.lang = new_lang
-        st.rerun()
-
-    st.divider()
-
     problem_ids = PB.list_problems()
-    problem_labels = {pid: f"{pid} — {_loc(PB.PROBLEMS[pid]['tema'], st.session_state.lang)}" for pid in problem_ids}
+    problem_labels = {
+        pid: f"{pid} — {_loc(PB.PROBLEMS[pid]['tema'])}"
+        for pid in problem_ids
+    }
 
     selected_pid = st.selectbox(
         _t("problem_label"),
@@ -260,22 +166,11 @@ with st.sidebar:
         key="selected_problem",
     )
 
-    student_id_input = st.text_input(
-        _t("nickname_label"),
-        value="",
-        max_chars=20,
-    )
-    if student_id_input:
-        st.session_state.student_id = student_id_input
-
     if st.button(_t("start_btn"), use_container_width=True, key="start_btn"):
-        st.session_state.tutor_state = T.new_session_state(
-            selected_pid, st.session_state.student_id
-        )
-        L.set_log_context(
-            student_id=st.session_state.student_id,
-            session_id=st.session_state.tutor_state["session_id"],
-        )
+        # Sessió anònima: `new_session_state` ja propaga el `session_id`
+        # al log de l'API amb `student_id=None`. No cal cridar
+        # `set_log_context` aquí.
+        st.session_state.tutor_state = T.new_session_state(selected_pid)
         st.session_state.input_counter = 0
         st.rerun()
 
@@ -283,9 +178,6 @@ with st.sidebar:
 
     with st.expander(_t("notation_title")):
         st.markdown(_t("notation_table"))
-
-    with st.expander(_t("signals_title")):
-        st.markdown(_t("signals_body"))
 
     if _is_debug_mode():
         st.divider()
@@ -301,7 +193,6 @@ with st.sidebar:
 # Panell principal
 # ------------------------------------------------------------
 state = st.session_state.tutor_state
-lang = st.session_state.lang
 
 if state is None:
     st.info(_t("select_problem"))
@@ -310,8 +201,8 @@ if state is None:
 problem = state["problem"]
 verdict_final = state.get("verdict_final")
 
-st.markdown(f"## {problem['id']} — {_loc(problem['tema'], lang)}")
-st.markdown(f"> {_loc(problem['enunciat'], lang)}")
+st.markdown(f"## {problem['id']} — {_loc(problem['tema'])}")
+st.markdown(f"> {_loc(problem['enunciat'])}")
 st.divider()
 
 for msg in state.get("messages", []):
@@ -333,13 +224,13 @@ if state.get("active_prereq"):
     if prereq:
         st.markdown("---")
         st.markdown(_t("prereq_title"))
-        st.markdown(f"**{_loc(prereq['question'], lang)}**")
+        st.markdown(f"**{_loc(prereq['question'])}**")
 
         with st.form(key=f"prereq_form_{st.session_state.input_counter}"):
             answer = st.text_area(_t("answer_label"), height=80)
             submitted = st.form_submit_button(_t("submit_btn"))
         if submitted and answer.strip():
-            new_state = T.process_turn(state, answer, lang=lang)
+            new_state = T.process_turn(state, answer)
             st.session_state.tutor_state = new_state
             st.session_state.input_counter += 1
             st.rerun()
@@ -350,10 +241,6 @@ if verdict_final == "solved":
     if _is_debug_mode():
         st.subheader(_t("trace_title"))
         st.json(T.build_trace(state))
-    st.stop()
-
-if verdict_final == "abandoned":
-    st.warning(_t("abandoned"))
     st.stop()
 
 if verdict_final == "referred_to_tutor":
@@ -373,54 +260,34 @@ step_idx = state["current_step_idx"]
 if step_idx < len(steps):
     step = steps[step_idx]
     st.markdown(f"**{_t('step_label').format(idx=step['id'], total=len(steps))}**")
-    st.markdown(f"> {_loc(step['text'], lang)}")
+    st.markdown(f"> {_loc(step['text'])}")
 
     history = state.get("history", [])
     if history:
         last = history[-1]
         verdict = last.get("verdict")
         if verdict == "correct":
-            st.success(f"✓ {last.get('reason', 'Correcte' if lang == 'ca' else 'Correct')}")
+            st.success(f"✓ {last.get('reason', 'Correcte')}")
         elif verdict in ("typical_error", "conceptual_gap"):
             label = last.get("error_label", "")
             raw_cat = PB.ERROR_CATALOG.get(label, "")
-            cat_msg = _loc(raw_cat, lang) if raw_cat else ""
+            cat_msg = _loc(raw_cat) if raw_cat else ""
             reason = last.get("reason", "")
             display = cat_msg or reason or _t("wrong_msg")
             st.warning(display)
-        elif verdict == "discrepancy":
-            st.info(_t("discrepancy_msg"))
 
+    # Formulari del pas: només un botó d'envia. Sense `?`/`!!` ni
+    # discrepància — la UI accepta exclusivament text que respon al pas.
     with st.form(key=f"step_form_{step_idx}_{st.session_state.input_counter}"):
         answer = st.text_area(
             _t("answer_label"),
             height=100,
             key=f"answer_{step_idx}_{st.session_state.input_counter}",
         )
-        col1, col2, col3 = st.columns([2, 1, 1])
-        with col1:
-            submitted = st.form_submit_button(_t("submit_btn"))
-        with col2:
-            hint_req = st.form_submit_button(_t("hint_btn"), key="hint_btn")
-        with col3:
-            exit_req = st.form_submit_button(_t("exit_btn"), key="exit_btn")
-
-    if exit_req:
-        new_state = T.process_turn(state, "!!", lang=lang)
-        st.session_state.tutor_state = new_state
-        st.rerun()
-
-    if hint_req:
-        new_state = T.process_turn(state, "?", lang=lang)
-        st.session_state.tutor_state = new_state
-        st.session_state.input_counter += 1
-        for msg in new_state.get("messages", []):
-            if msg["kind"] == "hint":
-                st.info(f"💡 {msg['text']}")
-        st.rerun()
+        submitted = st.form_submit_button(_t("submit_btn"))
 
     if submitted and answer.strip():
-        new_state = T.process_turn(state, answer, lang=lang)
+        new_state = T.process_turn(state, answer)
         st.session_state.tutor_state = new_state
         st.session_state.input_counter += 1
         st.rerun()
@@ -435,12 +302,11 @@ if history:
                 "correct": "green",
                 "typical_error": "orange",
                 "conceptual_gap": "red",
-                "discrepancy": "purple",
+                "no_math": "purple",
             }.get(verdict, "grey")
             step_label = turn.get("step_id", "?")
             st.markdown(
-                f"<span style='color:{color}'>**{'Pas' if lang == 'ca' else 'Step'} "
-                f"{step_label}** — {verdict}</span>",
+                f"<span style='color:{color}'>**Pas {step_label}** — {verdict}</span>",
                 unsafe_allow_html=True,
             )
             student_text = turn.get("student", turn.get("text", ""))
@@ -465,7 +331,7 @@ if _is_debug_mode():
             "verdict_final":      state["verdict_final"],
             "nodes_consolidated": state["nodes_consolidated"],
             "concept_failure_streak": state["concept_failure_streak"],
-            "lang":               lang,
+            "inappropriate_warnings": state["inappropriate_warnings"],
         })
     with col_b:
         st.subheader(_t("trace_title"))

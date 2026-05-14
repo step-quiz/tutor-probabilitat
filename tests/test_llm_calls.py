@@ -20,19 +20,20 @@ import llm
 
 
 # ---- Fixtures ----
-STEP_BAY_2 = {
+# Pas 2 de PROB-PAU-03: calcular P(S) per probabilitat total.
+STEP_PAU_2 = {
     "id": 2,
-    "text": "Calcula P(D), la probabilitat total d'obtenir una peça defectuosa.",
-    "expected_summary": "P(D) = 0.6·0.03 + 0.4·0.05 = 0.038",
+    "text": "Aplica la fórmula de la probabilitat total per calcular P(S).",
+    "expected_summary": "P(S) = P(S|I)·P(I) + P(S|Ī)·P(Ī) = 0.10·0.45 + 0.03·0.55 = 0.0615",
     "key_concepts": ["def_prob_total"],
     "input_type": "decimal",
-    "expected_value": 0.038,
+    "expected_value": 0.0615,
     "typical_error": "omitting one branch of the total probability expansion",
     "typical_error_label": "TOT_branca_oblidada",
 }
 
-PROBLEM_BAY01 = {
-    "id": "PROB-BAY-01",
+PROBLEM_PAU03 = {
+    "id": "PROB-PAU-03",
     "dependencies": ["def_prob_condicionada", "def_prob_total", "def_bayes"],
 }
 
@@ -51,7 +52,7 @@ class TestJudgeStep(unittest.TestCase):
     def test_correct_verdict(self):
         payload = {"verdict": "correct", "reason": "Bé!", "error_label": None}
         with _mock_call_json_returns(payload):
-            result = llm.judge_step(STEP_BAY_2, "0.038")
+            result = llm.judge_step(STEP_PAU_2, "0.0615")
         self.assertEqual(result["verdict"], "correct")
         self.assertEqual(result["reason"], "Bé!")
         self.assertIsNone(result["error_label"])
@@ -63,7 +64,7 @@ class TestJudgeStep(unittest.TestCase):
             "error_label": "TOT_branca_oblidada",
         }
         with _mock_call_json_returns(payload):
-            result = llm.judge_step(STEP_BAY_2, "0.018")
+            result = llm.judge_step(STEP_PAU_2, "0.018")
         self.assertEqual(result["verdict"], "typical_error")
         self.assertEqual(result["error_label"], "TOT_branca_oblidada")
 
@@ -74,14 +75,14 @@ class TestJudgeStep(unittest.TestCase):
             "error_label": None,
         }
         with _mock_call_json_returns(payload):
-            result = llm.judge_step(STEP_BAY_2, "No ho sé.")
+            result = llm.judge_step(STEP_PAU_2, "No ho sé.")
         self.assertEqual(result["verdict"], "conceptual_gap")
 
     def test_invalid_verdict_normalized(self):
         """Veredictes desconeguts es normalitzen a typical_error."""
         payload = {"verdict": "unknown_verdict", "reason": "?", "error_label": None}
         with _mock_call_json_returns(payload):
-            result = llm.judge_step(STEP_BAY_2, "alguna cosa")
+            result = llm.judge_step(STEP_PAU_2, "alguna cosa")
         self.assertEqual(result["verdict"], "typical_error")
 
 
@@ -93,14 +94,14 @@ class TestDiagnoseDependency(unittest.TestCase):
             "justification": "Student didn't apply total probability theorem.",
         }
         with _mock_call_json_returns(payload):
-            dep = llm.diagnose_dependency(STEP_BAY_2, "0.018", PROBLEM_BAY01)
+            dep = llm.diagnose_dependency(STEP_PAU_2, "0.018", PROBLEM_PAU03)
         self.assertEqual(dep, "def_prob_total")
 
     def test_invalid_dep_falls_back_to_first(self):
         """Si la IA retorna un dep_id no vàlid, fallback al primer dep del problema."""
         payload = {"dep_id": "dep_inexistent"}
         with _mock_call_json_returns(payload):
-            dep = llm.diagnose_dependency(STEP_BAY_2, "no sé.", PROBLEM_BAY01)
+            dep = llm.diagnose_dependency(STEP_PAU_2, "no sé.", PROBLEM_PAU03)
         # Ha de retornar el primer dep del problema, no el dep_inexistent
         self.assertEqual(dep, "def_prob_condicionada")
 
@@ -110,12 +111,12 @@ class TestGenerateHint(unittest.TestCase):
     def test_returns_stripped_text(self):
         hint_text = "  Recorda que la probabilitat total suma totes les branques.  "
         with _mock_call_text_returns(hint_text):
-            result = llm.generate_hint(STEP_BAY_2, "def_prob_total")
+            result = llm.generate_hint(STEP_PAU_2, "def_prob_total")
         self.assertEqual(result, "Recorda que la probabilitat total suma totes les branques.")
 
     def test_unknown_dep_uses_dep_id_as_desc(self):
         with _mock_call_text_returns("Aplica el concepte."):
-            result = llm.generate_hint(STEP_BAY_2, "dep_no_existent")
+            result = llm.generate_hint(STEP_PAU_2, "dep_no_existent")
         self.assertEqual(result, "Aplica el concepte.")
 
 

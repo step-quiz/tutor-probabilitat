@@ -1,7 +1,7 @@
 # Tutor de Probabilitat
 
 Tutor Socràtic pas a pas per a problemes de probabilitat de batxillerat
-(~17 anys). Bilingüe ca/en.
+(~17 anys). Interfície monolingüe en català; sessions anònimes.
 
 Cobreix: regla de Laplace, probabilitat condicionada, probabilitat
 total, teorema de Bayes, distribució binomial.

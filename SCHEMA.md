@@ -1,5 +1,12 @@
 # SCHEMA.md — Estructures de dades: Tutor de Probabilitat
 
+> **Nota sobre el bilingüisme.** Els camps marcats com a `{"ca": str, "en": str}`
+> mantenen tots dos idiomes a les dades, però la UI i l'engine només
+> renderitzen el català. `problems.get_localized(field)` retorna sempre
+> l'entrada "ca" (amb fallback a "en" si "ca" no existeix). Les entrades
+> "en" són reserva per a una futura extensió multilingüe; ara mateix no
+> les llegeix ningú.
+
 ## PROBLEMS
 
 Cada entrada de `PROBLEMS` té:
@@ -92,22 +99,20 @@ sense word-boundary). NO crida la IA. Veure `tutor._process_prereq_turn`.
 ```python
 {
   "session_id":             str,
-  "student_id":             str,
+  "student_id":             None,            # sempre None: sessió anònima
   "problem_id":             str,
   "problem":                dict,            # còpia del problema (per evitar mutar PROBLEMS)
   "started_at":             str,             # ISO 8601
   "started_at_ts":          float,           # epoch seconds
   "current_step_idx":       int,             # índex a problem["passos"]
   "history":                list,            # torns registrats (vegeu §History)
-  "hints_requested":        list,
   "stagnation_consecutive": int,
   "backtrack_count":        int,             # nº total de retrocessos a prereq
   "backtrack_depth":        int,             # profunditat actual del retrocés
-  "discrepancies":          list,
   "active_prereq":          str | None,      # PRE-xxx si dins d'un mini-exercici
   "active_prereq_depth":    int,
   "concept_failure_streak": dict,            # {dep_id: count}
-  "verdict_final":          str | None,      # "solved" | "abandoned" | "referred_to_tutor" | "suspended"
+  "verdict_final":          str | None,      # "solved" | "referred_to_tutor" | "suspended"
   "nodes_consolidated":     list,            # DAG nodes consolidats en sessió
   "pending_message":        None,            # slot reservat (no usat)
   "inappropriate_warnings": int,             # comptador d'ús inadequat (vegeu §Ús inadequat)
@@ -121,9 +126,12 @@ sense word-boundary). NO crida la IA. Veure `tutor._process_prereq_turn`.
 |---|---|
 | `None`                 | sessió en curs |
 | `"solved"`             | tots els passos completats correctament |
-| `"abandoned"`          | l'alumne ha sortit voluntàriament (`!!`, `exit`, `:q`) |
 | `"referred_to_tutor"`  | s'ha arribat a `MAX_BACKTRACK_DEPTH = 2` sense desbloquejar |
 | `"suspended"`          | s'ha arribat a `MAX_INAPPROPRIATE_WARNINGS = 3` (ús inadequat) |
+
+Nota: no existeix cap senyal d'usuari per abandonar la sessió. Si
+l'alumne tanca la pestanya, la sessió queda perduda (l'estat viu només
+a `st.session_state`).
 
 ### Ús inadequat
 
