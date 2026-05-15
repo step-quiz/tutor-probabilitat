@@ -882,3 +882,228 @@ def build_trace(state: dict) -> dict:
 def serialize_trace(state: dict) -> str:
     """Versió string del rastre, llesta per a `open(...).write()` o `st.json`."""
     return json.dumps(build_trace(state), ensure_ascii=False, indent=2)
+
+
+# ============================================================
+# Mode debug: test exhaustiu del flux end-to-end (CAPA B)
+# ============================================================
+# Adaptat de `tutor-eq/tutor.py::run_exhaustive_test`. Diferències clau
+# del nostre context:
+#
+#  - Tutor-eq tenia un model "una equació, baseline que avança per
+#    reescriptura". Nosaltres tenim "passos atòmics, baseline que
+#    avança per `current_step_idx`". Una "ronda" és un PAS del problema.
+#  - Tenim un veredicte extra: `incomplete`. Aquest NO avança el pas
+#    però tampoc és error: si el test l'espera, és match exacte.
+#  - Els nostres passos tenen verifiers deterministes (decimal /
+#    fraction / integer / set_listing). Per a aquests, els inputs
+#    parsejables NO criden la IA → cost API zero per a aquesta ronda.
+#    Útil igualment com a regressió de `_check_*`.
+#
+# Política d'aïllament del logging
+# --------------------------------
+# Reescrivim el context del thread a (student_id='__test_exhaustiu__',
+# session_id=<id efímer>) perquè el cost d'aquest test no es barregi
+# amb les analítiques de cap alumne real. El context anterior es
+# restaura al final via try/finally. Idèntic patró que tutor-eq.
+def run_exhaustive_test(problem_id: str, on_progress=None,
+                        session_id: str = None) -> list:
+    """
+    Executa la bateria de rondes de prova per a un problema, una ronda
+    per pas. Cada input del guió s'executa contra una CÒPIA del baseline,
+    per garantir que els tests són independents entre ells (un error en
+    un input no contamina els altres).
+
+    `on_progress(round_idx, n_rounds, item_idx, n_items)`: callback
+    opcional per a la UI; les excepcions del callback s'ignoren perquè
+    no han de poder tombar la bateria.
+
+    `session_id`: id per al logging. Si no se'n passa, se'n genera un.
+    El caller pot fer després `api_logger.summarize_session(sid)` per
+    saber el cost total d'aquesta execució.
+
+    Retorna una llista de dicts (una entrada per ronda) amb la forma:
+        {
+          "round":      int,       # 1-based
+          "step_id":    int | str, # del pas corresponent
+          "step_text":  str,       # text del pas (per al rastre humà)
+          "from_step_idx": int,    # current_step_idx del baseline a l'inici
+          "items": [
+            {
+              "input":               str,
+              "expected":            str,           # del schema TEST_CASES
+              "expected_error_label": str | None,
+              "rationale":           str,
+              "verdict":             str | None,    # gravat al history
+              "error_label":         str | None,
+              "feedback":            str,           # 1r missatge `feedback`
+              "missing":             str | None,    # només si verdict=="incomplete"
+              "next_question":       str | None,
+              "active_prereq":       str | None,
+              "match":               bool,
+              "exception":           str | None,
+            },
+            ...
+          ]
+        }
+
+    Nota d'errors
+    -------------
+    Les excepcions d'una crida individual a `process_turn` es capturen
+    al camp `exception` de l'item; no aturen el lot. Una excepció
+    catastròfica fora del bucle (per exemple, `problem_id` invàlid)
+    sí que es propaga al caller — és el que fa el lot 1-for-all per
+    comptar "errors_api" per problema.
+    """
+    rounds = PB.get_test_cases(problem_id)
+    if not rounds:
+        return []
+
+    test_sid = session_id or uuid.uuid4().hex[:12]
+    _prev_student, _prev_session = L.get_log_context()
+    L.set_log_context(student_id="__test_exhaustiu__", session_id=test_sid)
+    try:
+        return _run_exhaustive_test_inner(rounds, problem_id, on_progress)
+    finally:
+        L.set_log_context(student_id=_prev_student, session_id=_prev_session)
+
+
+def _run_exhaustive_test_inner(rounds, problem_id, on_progress):
+    # Baseline únic per a tot el test: comença al pas 1 i avança a cada
+    # ronda amb el primer input (que ha de ser correct). Si el primer
+    # input no avança (per regressió al model o als verifiers), trenquem
+    # el bucle perquè els passos posteriors no tindrien sentit.
+    baseline = new_session_state(problem_id)
+    all_results = []
+
+    for round_idx, round_items in enumerate(rounds, start=1):
+        if not round_items:
+            # Ronda buida al schema: la deixem registrada però sense items.
+            all_results.append({
+                "round":         round_idx,
+                "step_id":       None,
+                "step_text":     "",
+                "from_step_idx": baseline["current_step_idx"],
+                "items":         [],
+            })
+            continue
+
+        # Sanity check del schema: el primer item ha de ser correct.
+        # Si no, advertim al rastre però NO petem (potser és intencional
+        # per testos de regressió en què el correct no existeix encara).
+        if round_items[0].get("expected") != "correct":
+            schema_warning = (
+                f"Atenció: el primer item de la ronda {round_idx} té "
+                f"`expected={round_items[0].get('expected')!r}`, no `correct`. "
+                f"El baseline NO avançarà i les rondes següents es "
+                f"resoldran contra l'estat actual."
+            )
+        else:
+            schema_warning = None
+
+        step = baseline["problem"]["passos"][baseline["current_step_idx"]]
+        round_data = {
+            "round":         round_idx,
+            "step_id":       step.get("id"),
+            "step_text":     PB.get_localized(step.get("text", "")),
+            "from_step_idx": baseline["current_step_idx"],
+            "items":         [],
+        }
+        if schema_warning:
+            round_data["schema_warning"] = schema_warning
+
+        for item_idx, item_spec in enumerate(round_items):
+            if on_progress is not None:
+                try:
+                    on_progress(round_idx, len(rounds),
+                                item_idx + 1, len(round_items))
+                except Exception:
+                    pass
+
+            raw = item_spec.get("input", "")
+            expected = item_spec.get("expected", "correct")
+            expected_label = item_spec.get("expected_error_label")
+
+            item = {
+                "input":                raw,
+                "expected":             expected,
+                "expected_error_label": expected_label,
+                "rationale":            item_spec.get("rationale", ""),
+                "verdict":              None,
+                "error_label":          None,
+                "feedback":             "",
+                "missing":              None,
+                "next_question":        None,
+                "active_prereq":        None,
+                "match":                False,
+                "exception":            None,
+            }
+            try:
+                # IMPORTANT: el nostre process_turn fa `state = copy.deepcopy(state)`
+                # al començament i retorna el nou estat (NO muta in-place,
+                # a diferència de `tutor-eq`). Cal capturar el valor retornat.
+                test_state = process_turn(copy.deepcopy(baseline), raw)
+            except Exception as e:
+                # Capturem TIPUS + missatge — el tipus sol és poc útil,
+                # i el repr complet és massa sorollós.
+                item["exception"] = f"{type(e).__name__}: {e}"
+                round_data["items"].append(item)
+                continue
+
+            # Extreure la informació rellevant de l'estat resultant.
+            history_steps = [h for h in test_state.get("history", [])
+                             if h.get("type") == "step"]
+            last_step = history_steps[-1] if history_steps else {}
+            item["verdict"]       = last_step.get("verdict")
+            item["error_label"]   = last_step.get("error_label")
+            item["missing"]       = last_step.get("missing")
+            item["next_question"] = last_step.get("next_question")
+            item["active_prereq"] = test_state.get("active_prereq")
+            feedbacks = [m["text"] for m in test_state.get("messages", [])
+                         if m.get("kind") == "feedback"]
+            item["feedback"] = feedbacks[0] if feedbacks else ""
+
+            # Match: verdict ha de coincidir exactament. Si el guió
+            # especifica `expected_error_label`, també ha de coincidir
+            # (només té sentit quan expected ∈ {typical_error, conceptual_gap}).
+            verdict_match = (item["verdict"] == expected)
+            label_match = (
+                expected_label is None
+                or item["error_label"] == expected_label
+            )
+            item["match"] = verdict_match and label_match
+
+            round_data["items"].append(item)
+
+        all_results.append(round_data)
+
+        # Avançar el baseline amb el primer input (que hauria de ser
+        # `correct`). Si NO avança, trenquem el lot — els passos
+        # posteriors es resoldrien des d'un estat que no correspon.
+        try:
+            first_input = round_items[0].get("input", "")
+            # Re-assignem el baseline al retorn (process_turn NO muta in-place).
+            baseline = process_turn(baseline, first_input)
+            if baseline["current_step_idx"] == round_data["from_step_idx"]:
+                # El baseline NO ha avançat. Pot ser:
+                #  - el guió té un error (primer item no és realment correct),
+                #  - la IA està caiguda i el typical_error fallback s'ha disparat,
+                #  - o el verificador determinista ha refusat l'input.
+                # Sigui com sigui, no té sentit continuar.
+                all_results.append({
+                    "round":         round_idx + 1,
+                    "step_id":       None,
+                    "step_text":     "",
+                    "from_step_idx": baseline["current_step_idx"],
+                    "items":         [],
+                    "schema_warning": (
+                        f"Baseline no avançat després de la ronda {round_idx}. "
+                        f"Test interromput; les rondes >= {round_idx + 1} no "
+                        f"s'executen. Reviseu el primer item de la ronda {round_idx}."
+                    ),
+                })
+                break
+        except Exception:
+            break
+
+    return all_results

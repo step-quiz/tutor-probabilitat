@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import tutor as T
 import problems as PB  # noqa: F401 — importat per coherència amb test_tutor de tutor-grups
+import llm as L
 
 
 class TestNewSessionState(unittest.TestCase):
@@ -474,6 +475,219 @@ class TestIncompleteVerdict(unittest.TestCase):
             state = T.process_turn(state, "P(S|I)=0,1")
         trace = T.build_trace(state)
         self.assertEqual(trace["incomplete_followups"], 2)
+
+
+# ============================================================
+# Capa B: run_exhaustive_test
+# ============================================================
+# Tests amb `llm.judge_step` mockejat. NO criden la IA real. Validen la
+# infraestructura del runner (extracció de camps del state, càlcul del
+# match, captura d'excepcions, avanç de baseline, etc.). El test
+# "exhaustiu real" (cost API) NO és part d'aquesta suite — s'executa
+# manualment des del botó del mode debug.
+class TestExhaustiveTestRunner(unittest.TestCase):
+    """`tutor.run_exhaustive_test` — runner del test exhaustiu."""
+
+    def test_empty_test_cases_returns_empty_list(self):
+        """Un problema sense TEST_CASES retorna [] sense crides."""
+        # PROB-PAU-01 té entrada buida `[]` al schema → get_test_cases
+        # ha de retornar None i el runner ha de sortir aviat.
+        with patch("llm.judge_step") as mock_judge:
+            results = T.run_exhaustive_test("PROB-PAU-01")
+        self.assertEqual(results, [])
+        mock_judge.assert_not_called()
+
+    def test_unknown_problem_id_returns_empty_list(self):
+        results = T.run_exhaustive_test("PROB-INEXISTENT")
+        self.assertEqual(results, [])
+
+    def test_runner_executes_all_rounds_of_pau03(self):
+        """3 rondes × 4 inputs = 12 items per a PAU-03 (un problema real)."""
+        # Mockeggem judge_step amb una resposta `correct` per defecte
+        # (els passos deterministes no toquen la IA; al pas 1 free_text
+        # tots 4 inputs van a la IA mock).
+        def fake_judge(step, student, partials=None):
+            # Per al primer input "definitivament correcte" retornem correct;
+            # per als altres, typical_error. Detectem pel contingut.
+            if "P(Ī)" in student and "P(S|Ī)" in student:
+                return {"verdict": "correct", "reason": "OK",
+                        "error_label": None, "missing": None,
+                        "next_question": None}
+            if "P(I)=0,45 P(S|I)=0,1" in student or "P(I)=0.45 P(S|I)=0.1" in student:
+                return {"verdict": "incomplete", "reason": "Falten 2.",
+                        "error_label": None, "missing": "P(Ī).",
+                        "next_question": "I?"}
+            return {"verdict": "typical_error", "reason": "Mal.",
+                    "error_label": "COND_invertit", "missing": None,
+                    "next_question": None}
+
+        with patch("llm.judge_step", side_effect=fake_judge):
+            results = T.run_exhaustive_test("PROB-PAU-03")
+
+        # 3 rondes (una per pas).
+        self.assertEqual(len(results), 3)
+        # Cada ronda té 4 items.
+        for r in results:
+            self.assertEqual(len(r["items"]), 4)
+
+    def test_match_logic_verdict_only(self):
+        """Match=True quan el verdict coincideix amb l'expected."""
+        with patch("llm.judge_step") as mock_judge:
+            mock_judge.return_value = {
+                "verdict": "incomplete",
+                "reason": "Falten 2.",
+                "error_label": None,
+                "missing": "P(Ī).",
+                "next_question": "I?",
+            }
+            # PAU-03 ronda 1 item 2 té expected="incomplete".
+            results = T.run_exhaustive_test("PROB-PAU-03")
+        round1 = results[0]
+        item_incomplete = round1["items"][1]  # el cas del log 1b7c646b
+        self.assertEqual(item_incomplete["expected"], "incomplete")
+        self.assertEqual(item_incomplete["verdict"], "incomplete")
+        self.assertTrue(item_incomplete["match"])
+
+    def test_match_logic_with_expected_error_label(self):
+        """Quan expected_error_label és present, també ha de coincidir."""
+        # Forçem que la IA assigni un label diferent del que espera el guió.
+        with patch("llm.judge_step") as mock_judge:
+            mock_judge.return_value = {
+                "verdict": "typical_error",
+                "reason": "Mal.",
+                "error_label": "GEN_other",  # diferent del COND_invertit esperat
+                "missing": None,
+                "next_question": None,
+            }
+            results = T.run_exhaustive_test("PROB-PAU-03")
+        # Ronda 1 item 3: expected="typical_error",
+        # expected_error_label="COND_invertit". Verdict OK però label NO.
+        item = results[0]["items"][2]
+        self.assertEqual(item["expected"], "typical_error")
+        self.assertEqual(item["expected_error_label"], "COND_invertit")
+        self.assertEqual(item["verdict"], "typical_error")
+        self.assertEqual(item["error_label"], "GEN_other")
+        self.assertFalse(item["match"])  # label diferent → no match
+
+    def test_exception_swallowed_by_process_turn_surfaces_as_warning(self):
+        """`process_turn` ja captura les excepcions de `judge_step` i les
+        converteix en un missatge `warning` al state. El runner veu un
+        verdict=None sense un `exception` propagat. Aquest test documenta
+        aquest contracte (per si mai canvia)."""
+        with patch("llm.judge_step",
+                   side_effect=RuntimeError("simulated API timeout")):
+            results = T.run_exhaustive_test("PROB-PAU-03")
+        # Pas 1: tots els ítems han d'haver fallat sense excepció propagada
+        # i sense step entry al history (verdict=None).
+        pas1_items = results[0]["items"]
+        for it in pas1_items:
+            self.assertIsNone(it["exception"],
+                              "process_turn captura, el runner no ha de veure exception")
+            self.assertIsNone(it["verdict"])
+            self.assertFalse(it["match"])
+        # El baseline NO ha avançat (no hi ha hagut "correct"); ha de
+        # produir l'entrada d'interrupció.
+        self.assertEqual(len(results), 2)
+        interrupt = results[1]
+        self.assertEqual(interrupt["items"], [])
+        self.assertIn("schema_warning", interrupt)
+
+    def test_exception_outside_judge_does_propagate_to_item(self):
+        """Si `process_turn` peta per una excepció NO capturada (per
+        exemple, bug intern al copy.deepcopy), llavors el runner sí que
+        atrapa l'excepció al camp `exception`."""
+        # Mockejar copy.deepcopy de tutor per fer-lo petar dins process_turn.
+        original_deepcopy = T.copy.deepcopy
+        call_count = [0]
+        def flaky_deepcopy(x):
+            call_count[0] += 1
+            # La primera crida ve del runner (copia el baseline). Deixem-la
+            # passar. La segona ve de process_turn (copia el seu state).
+            # Aquesta la fem petar.
+            if call_count[0] == 2:
+                raise RuntimeError("simulated internal bug")
+            return original_deepcopy(x)
+
+        with patch("llm.judge_step") as mock_judge, \
+             patch.object(T.copy, "deepcopy", side_effect=flaky_deepcopy):
+            mock_judge.return_value = {
+                "verdict": "correct", "reason": "OK", "error_label": None,
+                "missing": None, "next_question": None,
+            }
+            results = T.run_exhaustive_test("PROB-PAU-03")
+        # El primer item de la ronda 1 ha de tenir exception.
+        first_item = results[0]["items"][0]
+        self.assertIsNotNone(first_item["exception"])
+        self.assertIn("simulated internal bug", first_item["exception"])
+
+    def test_baseline_advances_after_first_correct(self):
+        """El baseline ha de passar al pas següent després d'una correct."""
+        # Mockeggem judge_step amb tot correct (només cal per al pas 1
+        # free_text). Els passos 2/3 deterministes acceptaran les
+        # respostes correctes dels TEST_CASES.
+        with patch("llm.judge_step") as mock_judge:
+            mock_judge.return_value = {
+                "verdict": "correct",
+                "reason": "OK",
+                "error_label": None,
+                "missing": None,
+                "next_question": None,
+            }
+            results = T.run_exhaustive_test("PROB-PAU-03")
+        # Una entrada per ronda + cap entrada d'interrupció.
+        self.assertEqual(len(results), 3)
+        self.assertEqual(results[0]["from_step_idx"], 0)
+        self.assertEqual(results[1]["from_step_idx"], 1)
+        self.assertEqual(results[2]["from_step_idx"], 2)
+
+    def test_runner_isolates_log_context(self):
+        """El runner reescriu el log_context i el restaura després."""
+        # Set un context "alumne real".
+        L.set_log_context(student_id="alumne_X", session_id="sessio_real")
+        try:
+            with patch("llm.judge_step") as mock_judge:
+                mock_judge.return_value = {
+                    "verdict": "correct", "reason": "OK", "error_label": None,
+                    "missing": None, "next_question": None,
+                }
+                T.run_exhaustive_test("PROB-PAU-03", session_id="test_abc")
+            # Després del test, ha de tornar al context original.
+            stu, sid = L.get_log_context()
+            self.assertEqual(stu, "alumne_X")
+            self.assertEqual(sid, "sessio_real")
+        finally:
+            L.set_log_context(student_id=None, session_id=None)
+
+    def test_progress_callback_invoked_correctly(self):
+        """on_progress es crida amb (round_idx, n_rounds, item_idx, n_items)."""
+        calls = []
+        def on_p(r, nr, i, ni):
+            calls.append((r, nr, i, ni))
+        with patch("llm.judge_step") as mock_judge:
+            mock_judge.return_value = {
+                "verdict": "correct", "reason": "OK", "error_label": None,
+                "missing": None, "next_question": None,
+            }
+            T.run_exhaustive_test("PROB-PAU-03", on_progress=on_p)
+        # 3 rondes × 4 items = 12 crides al callback.
+        self.assertEqual(len(calls), 12)
+        # Primer call: ronda 1, 3 rondes, item 1, 4 items.
+        self.assertEqual(calls[0], (1, 3, 1, 4))
+        # Última crida: ronda 3, 3 rondes, item 4, 4 items.
+        self.assertEqual(calls[-1], (3, 3, 4, 4))
+
+    def test_progress_callback_exception_does_not_break(self):
+        """Si on_progress peta, el runner ha de continuar."""
+        def bad_callback(*args):
+            raise RuntimeError("UI crashed")
+        with patch("llm.judge_step") as mock_judge:
+            mock_judge.return_value = {
+                "verdict": "correct", "reason": "OK", "error_label": None,
+                "missing": None, "next_question": None,
+            }
+            # No ha de propagar l'excepció.
+            results = T.run_exhaustive_test("PROB-PAU-03", on_progress=bad_callback)
+        self.assertEqual(len(results), 3)
 
 
 if __name__ == "__main__":

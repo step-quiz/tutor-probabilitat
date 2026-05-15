@@ -15,7 +15,11 @@ Aquesta UI és monolingüe (català) i anònima:
   decideix l'engine via `_handle_conceptual_gap`).
 """
 
+import json
 import os
+import uuid
+from datetime import datetime
+
 import streamlit as st
 
 import problems as PB
@@ -471,7 +475,377 @@ if _is_debug_mode():
             "nodes_consolidated": state["nodes_consolidated"],
             "concept_failure_streak": state["concept_failure_streak"],
             "inappropriate_warnings": state["inappropriate_warnings"],
+            "step_partials":      state.get("step_partials", []),
         })
     with col_b:
         st.subheader(_t("trace_title"))
         st.json(T.build_trace(state))
+
+    # =====================================================================
+    # CAPA B — Test exhaustiu + Test 1-for-all
+    # =====================================================================
+    # Tots dos botons estan al panell de DEBUG (només visible amb ?debug=1).
+    # Fan crides REALS a la IA → cost monetari. El test 1-for-all té doble
+    # confirmació per protegir-se de clics accidentals (cost notable).
+    # Portat del patró validat a `tutor-eq/app.py`.
+
+    st.divider()
+    st.markdown("### 🧪 Test exhaustiu (mode debug)")
+
+    # ---- Cost de la sessió actual ------------------------------------
+    # Mostrem què hem gastat fins ara per orientar el cost addicional
+    # del test. summarize_session() és no-bloquejant i barat (llegeix
+    # el fitxer JSONL del dia).
+    try:
+        current_sid = L.get_session_id()
+        sess_summary = api_logger.summarize_session(current_sid)
+        if sess_summary["calls_total"] > 0:
+            st.caption(
+                f"Sessió actual · {sess_summary['calls_total']} crides · "
+                f"{sess_summary['tokens_input']:,}↓ + "
+                f"{sess_summary['tokens_output']:,}↑ tokens · "
+                f"~${sess_summary['cost_usd']:.4f}"
+            )
+        else:
+            st.caption("Sessió actual · cap crida encara")
+    except Exception:
+        # Si el log encara no existeix o falla per qualsevol motiu, no
+        # bloquegem el panell — el test pot funcionar igual.
+        pass
+    st.caption(f"Log: `{api_logger.get_log_path()}`")
+
+    # ---- Test exhaustiu d'aquest problema ----------------------------
+    rounds = PB.get_test_cases(state["problem_id"]) or []
+    n_rounds = len(rounds)
+    n_items = sum(len(r) for r in rounds)
+    if n_rounds == 0:
+        st.caption(
+            f"No hi ha casos de test definits per a "
+            f"`{state['problem_id']}`. Definiu-ne a "
+            f"`problems.TEST_CASES`."
+        )
+    else:
+        st.caption(
+            f"Executa **{n_items}** input(s) repartits en {n_rounds} "
+            f"ronda(es) sobre `{state['problem_id']}`. Fa crides reals "
+            f"a la IA per als passos `free_text`; els determinístics no "
+            f"costen res."
+        )
+        if st.button("🧪 Test exhaustiu",
+                     key="test_exhaustiu_btn",
+                     use_container_width=True):
+            test_sid = uuid.uuid4().hex[:12]
+            progress_box = st.empty()
+
+            def _on_progress(r_idx, n_r, i_idx, n_i):
+                progress_box.info(
+                    f"Test exhaustiu: ronda {r_idx}/{n_r}, "
+                    f"input {i_idx}/{n_i}…"
+                )
+
+            with st.spinner("Executant test exhaustiu…"):
+                results = T.run_exhaustive_test(
+                    state["problem_id"],
+                    on_progress=_on_progress,
+                    session_id=test_sid,
+                )
+            progress_box.empty()
+            cost = api_logger.summarize_session(test_sid)
+            st.session_state.test_exhaustiu_results = {
+                "problem_id": state["problem_id"],
+                "results":    results,
+                "test_sid":   test_sid,
+                "cost":       cost,
+                "finished_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            st.rerun()
+
+        # ---- Resultats persistits al session_state -------------------
+        # Sobreviuen a `rerun`s; l'usuari pot tancar-los manualment.
+        exh = st.session_state.get("test_exhaustiu_results")
+        if exh and exh.get("problem_id") == state["problem_id"]:
+            results = exh["results"]
+            cost = exh["cost"]
+
+            # Resum: matches / mismatches / excepcions
+            n_total = 0
+            n_match = 0
+            n_exc = 0
+            for r in results:
+                for it in r.get("items", []):
+                    n_total += 1
+                    if it.get("exception"):
+                        n_exc += 1
+                    if it.get("match"):
+                        n_match += 1
+            mismatches = n_total - n_match
+            ok_msg = f"{n_match}/{n_total} matches"
+            if mismatches:
+                ok_msg += f" · {mismatches} mismatch(es)"
+            if n_exc:
+                ok_msg += f" · {n_exc} excepció/ns"
+            st.markdown(
+                f"**Resultats:** {ok_msg} · cost: "
+                f"{cost['calls_total']} crides · "
+                f"~${cost['cost_usd']:.4f}"
+            )
+
+            # Per-ronda: una expander cadascuna. La capçalera mostra
+            # ràpid si tot ha anat bé per a aquell pas; obrint-la es
+            # veu el detall (input, expected, verdict, error_label,
+            # missing/next_question si incomplete).
+            for r in results:
+                items = r.get("items", [])
+                if not items:
+                    continue
+                round_match = sum(1 for it in items if it["match"])
+                round_total = len(items)
+                icon = "✅" if round_match == round_total else "⚠️"
+                label = (
+                    f"{icon} Ronda {r['round']} — pas {r['step_id']} "
+                    f"({round_match}/{round_total})"
+                )
+                with st.expander(label, expanded=(round_match != round_total)):
+                    if r.get("schema_warning"):
+                        st.warning(r["schema_warning"])
+                    for it in items:
+                        st.markdown(
+                            f"- {'✅' if it['match'] else '❌'} "
+                            f"`{it['input']}` → expected "
+                            f"**{it['expected']}**"
+                            + (f" (`{it['expected_error_label']}`)"
+                               if it.get("expected_error_label") else "")
+                            + f", got **{it['verdict']}**"
+                            + (f" (`{it['error_label']}`)"
+                               if it.get("error_label") else "")
+                        )
+                        if it.get("exception"):
+                            st.error(f"Excepció: `{it['exception']}`")
+                        if it.get("missing") or it.get("next_question"):
+                            st.caption(
+                                f"missing: {it.get('missing')!r} · "
+                                f"next_question: {it.get('next_question')!r}"
+                            )
+                        if it.get("rationale"):
+                            st.caption(f"_Justificació del cas:_ {it['rationale']}")
+
+            # Botó per descarregar el JSON sencer (útil per a anàlisi
+            # offline amb un LLM auxiliar).
+            st.download_button(
+                "⬇️ Descarrega JSON",
+                data=json.dumps(exh, ensure_ascii=False, indent=2),
+                file_name=(
+                    f"test_exhaustiu_{state['problem_id']}_"
+                    f"{exh['test_sid']}.json"
+                ),
+                mime="application/json",
+                key="test_exhaustiu_download",
+                use_container_width=True,
+            )
+            if st.button("Tanca resultats", key="test_exhaustiu_clear",
+                         use_container_width=True):
+                st.session_state.test_exhaustiu_results = None
+                st.rerun()
+
+    # ---- Test 1-for-all ---------------------------------------------
+    # Itera el test exhaustiu sobre TOTS els problemes amb TEST_CASES no
+    # buit i genera un únic JSON consolidat. Cost potencialment alt
+    # (segons quants problemes tinguin casos), per això té doble
+    # confirmació.
+    st.markdown("---")
+    st.markdown("### 🧪 Test 1-for-all")
+    problems_with_cases = sorted(
+        pid for pid in PB.TEST_CASES if PB.get_test_cases(pid)
+    )
+    n_problems_total = len(problems_with_cases)
+    n_problems_in_dict = len(PB.TEST_CASES)
+    if n_problems_total == 0:
+        st.caption(
+            "Cap problema té casos de test definits. Definiu-ne a "
+            "`problems.TEST_CASES`."
+        )
+    else:
+        st.caption(
+            f"Executa el test exhaustiu sobre **{n_problems_total} dels "
+            f"{n_problems_in_dict}** problemes registrats (els que tenen "
+            f"casos no buits). Genera un únic informe JSON. "
+            f"**Cost API moderat** — només per a validació puntual."
+        )
+        awaiting = st.session_state.get("awaiting_1forall_confirm", False)
+        if not awaiting:
+            if st.button("🧪 Test 1-for-all",
+                         key="test_1forall_btn",
+                         use_container_width=True):
+                st.session_state.awaiting_1forall_confirm = True
+                st.rerun()
+        else:
+            st.warning(
+                "Confirmes? Aquest test pot tenir un cost notable "
+                "(~$0,02–0,15 amb gemini-2.5-flash, depèn de quants "
+                "problemes tinguin casos)."
+            )
+            col_y, col_n = st.columns(2)
+            with col_y:
+                if st.button("✅ Acceptar",
+                             key="test_1forall_accept",
+                             use_container_width=True):
+                    st.session_state.awaiting_1forall_confirm = False
+                    batch_sid = uuid.uuid4().hex[:12]
+                    progress_box = st.empty()
+                    report = {
+                        "schema_version": 1,
+                        "kind":           "test_1forall",
+                        "started_at":     datetime.now().isoformat(
+                            timespec="seconds"),
+                        "model":          getattr(L, "MODEL", "unknown"),
+                        "batch_session_id": batch_sid,
+                        "problems":       [],
+                        "summary":        {},
+                    }
+                    n_done = 0
+                    n_err_api = 0
+                    with st.spinner(
+                        f"Test 1-for-all en marxa ({n_problems_total} "
+                        f"problemes). No tanquis la pestanya…"
+                    ):
+                        for pid in problems_with_cases:
+                            n_done += 1
+                            progress_box.info(
+                                f"Test 1-for-all: problema "
+                                f"{n_done}/{n_problems_total} ({pid})…"
+                            )
+                            entry = {
+                                "problem_id":          pid,
+                                "tema":                _loc(
+                                    PB.PROBLEMS[pid].get("tema", "")),
+                                "errors_freqüents_declarats": list(
+                                    PB.PROBLEMS[pid].get(
+                                        "errors_freqüents", [])),
+                                "n_rounds": len(
+                                    PB.get_test_cases(pid) or []),
+                                "results":      None,
+                                "error_api":    False,
+                                "error_message": None,
+                                "sub_session_id": None,
+                            }
+                            sub_sid = f"{batch_sid}_{pid}"
+                            try:
+                                entry["results"] = T.run_exhaustive_test(
+                                    pid, on_progress=None,
+                                    session_id=sub_sid,
+                                )
+                                entry["sub_session_id"] = sub_sid
+                            except Exception as e:
+                                entry["error_api"] = True
+                                entry["error_message"] = (
+                                    f"{type(e).__name__}: {e}")
+                                n_err_api += 1
+                            report["problems"].append(entry)
+                    progress_box.empty()
+
+                    # Resum agregat per a una primera ullada de l'LLM
+                    # analitzador. Comptem matches/mismatches/excepcions
+                    # i agrupem mismatches per problema (clau per a
+                    # detecció ràpida d'inconsistències).
+                    n_items = 0
+                    n_items_match = 0
+                    n_items_exc = 0
+                    mismatches_by_problem = {}
+                    for pe in report["problems"]:
+                        if pe["error_api"] or pe["results"] is None:
+                            continue
+                        for rd in pe["results"]:
+                            for it in rd.get("items", []):
+                                n_items += 1
+                                if it.get("exception"):
+                                    n_items_exc += 1
+                                if it.get("match"):
+                                    n_items_match += 1
+                                else:
+                                    mismatches_by_problem.setdefault(
+                                        pe["problem_id"], []
+                                    ).append({
+                                        "round":    rd["round"],
+                                        "step_id":  rd["step_id"],
+                                        "input":    it["input"],
+                                        "expected": it["expected"],
+                                        "got_verdict":     it.get("verdict"),
+                                        "got_error_label": it.get("error_label"),
+                                        "exception":       it.get("exception"),
+                                    })
+
+                    # Cost total: cada sub_sid registra el seu cost al
+                    # mateix fitxer JSONL. Sumem per agregar.
+                    total_calls = 0
+                    total_tin = 0
+                    total_tout = 0
+                    total_cost = 0.0
+                    for pe in report["problems"]:
+                        sid = pe.get("sub_session_id")
+                        if not sid:
+                            continue
+                        try:
+                            s = api_logger.summarize_session(sid)
+                            total_calls += s.get("calls_total", 0)
+                            total_tin   += s.get("tokens_input", 0)
+                            total_tout  += s.get("tokens_output", 0)
+                            total_cost  += s.get("cost_usd", 0.0)
+                        except Exception:
+                            pass
+
+                    report["summary"] = {
+                        "n_problems_total":   n_problems_total,
+                        "n_problems_ok":      n_problems_total - n_err_api,
+                        "n_problems_error_api": n_err_api,
+                        "n_items_total":      n_items,
+                        "n_items_match":      n_items_match,
+                        "n_items_mismatch":   n_items - n_items_match,
+                        "n_items_exception":  n_items_exc,
+                        "mismatches_by_problem": mismatches_by_problem,
+                        "cost": {
+                            "calls_total":  total_calls,
+                            "tokens_input": total_tin,
+                            "tokens_output": total_tout,
+                            "cost_usd":     round(total_cost, 6),
+                        },
+                    }
+                    report["finished_at"] = datetime.now().isoformat(
+                        timespec="seconds")
+                    st.session_state.test_1forall_report = report
+                    st.rerun()
+            with col_n:
+                if st.button("❌ Cancel·lar",
+                             key="test_1forall_cancel",
+                             use_container_width=True):
+                    st.session_state.awaiting_1forall_confirm = False
+                    st.rerun()
+
+        # ---- Mostrar informe 1-for-all si disponible ----------------
+        rep = st.session_state.get("test_1forall_report")
+        if rep:
+            summ = rep["summary"]
+            st.success(
+                f"Test acabat: {summ['n_problems_ok']}/"
+                f"{summ['n_problems_total']} problemes OK · "
+                f"{summ['n_items_match']}/{summ['n_items_total']} "
+                f"matches · cost ~${summ['cost']['cost_usd']:.4f}"
+            )
+            if summ["mismatches_by_problem"]:
+                st.warning(
+                    f"Mismatches a {len(summ['mismatches_by_problem'])} "
+                    f"problema(es). Veure JSON per al detall."
+                )
+            st.download_button(
+                "⬇️ Descarrega informe JSON",
+                data=json.dumps(rep, ensure_ascii=False, indent=2),
+                file_name=(
+                    f"test_1forall_{rep['batch_session_id']}.json"
+                ),
+                mime="application/json",
+                key="test_1forall_download",
+                use_container_width=True,
+            )
+            if st.button("Tanca informe", key="test_1forall_clear",
+                         use_container_width=True):
+                st.session_state.test_1forall_report = None
+                st.rerun()

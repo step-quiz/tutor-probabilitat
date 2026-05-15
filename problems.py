@@ -1900,6 +1900,218 @@ PILOT_PATH = [
 ]
 
 
+# ============================================================
+# TEST_CASES — guió per al mode debug ("Test exhaustiu")
+# ============================================================
+# Per què existeix
+# ---------------
+# Els tests unitaris a `tests/test_tutor.py` mockegen la IA. Validen
+# QUÈ passa SI la IA retorna `incomplete` (o el que sigui), però no
+# validen si el prompt _SYSTEM_JUDGE realment fa que la IA retorni el
+# veredicte esperat. Per saber-ho cal cridar la IA real, cosa que té
+# cost monetari i triga. Aquest test és precisament això: un guió
+# d'inputs amb veredictes esperats que crida la IA i compara.
+#
+# Modus operandi
+# --------------
+# Cada problema té una llista de RONDES, una per pas. Cada ronda és
+# una llista d'INPUTS de prova. Convenció:
+#   - El PRIMER input de cada ronda ha de tenir `expected="correct"`:
+#     s'usa per avançar el baseline a la ronda següent (mateix patró
+#     que el test exhaustiu de tutor-eq).
+#   - Els altres inputs poden ser `incomplete`, `typical_error`, o
+#     `conceptual_gap`. NO avancen el baseline.
+#
+# Per a passos amb verificador determinista (decimal/fraction/integer)
+# la "IA" no es crida: el match es resol localment sense cost. Útil
+# igual com a regressió de `tutor._check_*`.
+#
+# Schema de cada item
+# -------------------
+#   {
+#     "input": str,                    # el que escriuria l'alumne
+#     "expected": "correct" | "incomplete" | "typical_error" | "conceptual_gap",
+#     "expected_error_label": str | None,  # opcional, només si vol comprovar l'etiqueta
+#     "rationale": str,                # explicació humana del cas (no s'usa per al match)
+#   }
+#
+# Si `expected_error_label` està present, el match exigeix que el
+# `error_label` registrat al history també coincideixi. Si no hi és,
+# només es comprova el verdict.
+#
+# Política d'errors
+# -----------------
+# Els tests no s'aturen per una excepció: el runner captura i la
+# registra al camp `exception` de l'item. Així podem revisar offline
+# si una falla és intermitent (timeout de la IA) o sistemàtica.
+#
+# Cost API estimat per execució completa (amb gemini-2.5-flash):
+#   PAU-01: 2 free_text × 4 inputs = ~8 crides
+#   PAU-02: 1 free_text × 4 inputs = ~4 crides
+#   PAU-03: 1 free_text × 4 inputs = ~4 crides
+#   PAU-04: 0 free_text = 0 crides
+#   PAU-05: 2 free_text × 4 inputs = ~8 crides
+#   PAU-06: 1 free_text × 4 inputs = ~4 crides
+#   Total: ~28 crides → ~$0.02-0.10 per execució completa.
+# (`conceptual_gap` afegeix crides extres a `diagnose_dependency` i
+# `generate_hint`, però no penalitza el test runner: les comptem totes
+# al cost report).
+TEST_CASES = {
+    # ============================================================
+    # PROB-PAU-03 — prototip de la Capa B
+    # ============================================================
+    # Inclou EXPLÍCITAMENT el cas històric del log api_calls_2026-05-14.jsonl
+    # (sessió 1b7c646b, 06:33) que va motivar la Capa 1 d'`incomplete`. Si
+    # mai un canvi futur al prompt `_SYSTEM_JUDGE` torna a fer marcar
+    # aquell input com a `conceptual_gap`, aquest test ho detectarà abans
+    # que cap alumne ho pateixi.
+    "PROB-PAU-03": [
+        # ---------- Ronda 1 (pas 1, free_text) — defineix els 4 valors ----------
+        [
+            {
+                "input": (
+                    "I = «practica esports d'impacte», "
+                    "S = «pateix sesamoïditis». "
+                    "P(I) = 0.45, P(Ī) = 0.55, P(S|I) = 0.10, P(S|Ī) = 0.03."
+                ),
+                "expected": "correct",
+                "rationale": (
+                    "Identificació completa i correcta dels 4 valors + "
+                    "definició dels esdeveniments."
+                ),
+            },
+            {
+                "input": (
+                    "I = «practica esports d'impacte», "
+                    "S = «pateix sesamoïditis». P(I)=0,45 P(S|I)=0,1"
+                ),
+                "expected": "incomplete",
+                "rationale": (
+                    "REGRESSIÓ del log 1b7c646b (2026-05-14, 06:33): "
+                    "l'alumne defineix bé els esdeveniments i identifica "
+                    "DOS dels quatre valors. Abans de Capa 1 marcava "
+                    "conceptual_gap i disparava retrocés injust a "
+                    "PRE-COND. Ara ha de marcar `incomplete`."
+                ),
+            },
+            {
+                "input": (
+                    "P(I|S) = 0.10, P(I|Ī) = 0.03, P(I) = 0.45, P(Ī) = 0.55"
+                ),
+                "expected": "typical_error",
+                "expected_error_label": "COND_invertit",
+                "rationale": (
+                    "Inverteix la condicionada: escriu P(I|S) en comptes de "
+                    "P(S|I). És l'error tipus del pas (typical_error_label "
+                    "del pas 1 al schema)."
+                ),
+            },
+            {
+                "input": (
+                    "P(I) = 0.45, P(Ī) = 0.45, P(S|I) = 0.10, P(S|Ī) = 0.03"
+                ),
+                "expected": "typical_error",
+                "rationale": (
+                    "Error de complementari: P(Ī) = 0.45 (copia P(I) en "
+                    "comptes de 1−P(I)). La IA pot marcar-ho com a "
+                    "typical_error o conceptual_gap; el match no exigeix "
+                    "label específica."
+                ),
+            },
+        ],
+        # ---------- Ronda 2 (pas 2, decimal — determinista) ----------
+        # Els 4 inputs es resolen sense crida a la IA (parsegen com a
+        # decimal i el verifier determinista decideix). Cost API: 0.
+        [
+            {
+                "input": "0.0615",
+                "expected": "correct",
+                "rationale": "P(S) = 0.10·0.45 + 0.03·0.55 = 0.0615.",
+            },
+            {
+                "input": "0.045",
+                "expected": "typical_error",
+                "expected_error_label": "TOT_branca_oblidada",
+                "rationale": (
+                    "Només la branca I: 0.10·0.45 = 0.045. Oblida la "
+                    "branca Ī (l'error més comú a aquest pas)."
+                ),
+            },
+            {
+                "input": "0.0165",
+                "expected": "typical_error",
+                "expected_error_label": "TOT_branca_oblidada",
+                "rationale": (
+                    "Només la branca Ī: 0.03·0.55 = 0.0165. Variant "
+                    "simètrica del cas anterior."
+                ),
+            },
+            {
+                "input": "0.13",
+                "expected": "typical_error",
+                "expected_error_label": "TOT_branca_oblidada",
+                "rationale": (
+                    "Suma de prob. condicionades sense ponderar pels "
+                    "marginals: 0.10 + 0.03 = 0.13. Cau a "
+                    "typical_error_label per defecte del pas."
+                ),
+            },
+        ],
+        # ---------- Ronda 3 (pas 3, fraction — determinista) ----------
+        # `_check_numeric` accepta tant fracció com decimal amb
+        # tolerància 1e-4. Cost API: 0 si tot parseja.
+        [
+            {
+                "input": "30/41",
+                "expected": "correct",
+                "rationale": "Bayes exacte: P(S|I)·P(I)/P(S) = 30/41.",
+            },
+            {
+                "input": "0.7317",
+                "expected": "correct",
+                "rationale": (
+                    "Decimal equivalent a 30/41 (dins tolerància 1e-4). "
+                    "Cobreix la doble forma acceptada pel verifier."
+                ),
+            },
+            {
+                "input": "41/30",
+                "expected": "typical_error",
+                "expected_error_label": "BAY_invertit",
+                "rationale": (
+                    "Inverteix numerador/denominador (1.367 en lloc de "
+                    "0.7317). És el typical_error_label del pas 3."
+                ),
+            },
+            {
+                "input": "0.045",
+                "expected": "typical_error",
+                "expected_error_label": "BAY_invertit",
+                "rationale": (
+                    "Oblida dividir per P(S) (només calcula el numerador "
+                    "P(S|I)·P(I) = 0.045). És el segon error més freqüent."
+                ),
+            },
+        ],
+    ],
+
+    # ============================================================
+    # Altres problemes — guions pendents
+    # ============================================================
+    # Es deixen com a llistes buides perquè:
+    # (a) el botó "Test exhaustiu" s'amagui per a problemes sense
+    #     casos (vegeu `get_test_cases` que retorna None per a llistes
+    #     buides), i
+    # (b) el "Test 1-for-all" pugui detectar problemes sense cobertura.
+    # S'ompliran iterativament, validant el format amb PAU-03 primer.
+    "PROB-PAU-01": [],
+    "PROB-PAU-02": [],
+    "PROB-PAU-04": [],
+    "PROB-PAU-05": [],
+    "PROB-PAU-06": [],
+}
+
+
 # ---------- Accessors ----------
 def get_problem(problem_id: str) -> dict:
     p = PROBLEMS.get(problem_id)
@@ -1918,3 +2130,18 @@ def get_prerequisite(prereq_id: str) -> dict:
 
 def list_problems():
     return list(PROBLEMS.keys())
+
+
+def get_test_cases(problem_id: str):
+    """
+    Retorna la llista de rondes de test per a un problema, o None si
+    no n'hi ha cap definida (perquè la UI pugui amagar el botó).
+
+    Una llista buida `[]` també retorna None: convencionalment significa
+    "el problema està a l'inventari de TEST_CASES però encara no s'ha
+    omplert el guió".
+    """
+    rounds = TEST_CASES.get(problem_id)
+    if not rounds:  # None o []
+        return None
+    return rounds
