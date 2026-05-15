@@ -963,17 +963,22 @@ def run_exhaustive_test(problem_id: str, on_progress=None,
     _prev_student, _prev_session = L.get_log_context()
     L.set_log_context(student_id="__test_exhaustiu__", session_id=test_sid)
     try:
-        return _run_exhaustive_test_inner(rounds, problem_id, on_progress)
+        return _run_exhaustive_test_inner(rounds, problem_id, on_progress, test_sid)
     finally:
         L.set_log_context(student_id=_prev_student, session_id=_prev_session)
 
 
-def _run_exhaustive_test_inner(rounds, problem_id, on_progress):
-    # Baseline únic per a tot el test: comença al pas 1 i avança a cada
-    # ronda amb el primer input (que ha de ser correct). Si el primer
-    # input no avança (per regressió al model o als verifiers), trenquem
-    # el bucle perquè els passos posteriors no tindrien sentit.
+def _run_exhaustive_test_inner(rounds, problem_id, on_progress, test_sid):
+    # OJO subtilesa de threading: `new_session_state` crida internament
+    # `L.set_log_context(student_id=None, session_id=<uuid_nou>)`. Això
+    # SOBREESCRIU el context que el wrapper acaba de fixar. Sense
+    # restaurar-lo, totes les crides reals a `judge_step` durant el
+    # test es loguen sota l'uuid aleatori, no sota `test_sid`. Resultat:
+    # `summarize_session(test_sid)` torna 0 crides. Per això fixem el
+    # context EN AQUEST punt — i a cada `process_turn` no cal tornar-ho
+    # a fer perquè `process_turn` NO el toca.
     baseline = new_session_state(problem_id)
+    L.set_log_context(student_id="__test_exhaustiu__", session_id=test_sid)
     all_results = []
 
     for round_idx, round_items in enumerate(rounds, start=1):

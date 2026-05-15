@@ -689,6 +689,50 @@ class TestExhaustiveTestRunner(unittest.TestCase):
             results = T.run_exhaustive_test("PROB-PAU-03", on_progress=bad_callback)
         self.assertEqual(len(results), 3)
 
+    def test_log_context_remains_test_sid_during_run(self):
+        """REGRESSIÓ: `new_session_state` crida internament `set_log_context`
+        amb un session_id NOU. Si el runner no el restaura després, totes
+        les crides reals a la IA quedaven loguejades sota aquest uuid
+        aleatori en lloc del `test_sid`, i `summarize_session(test_sid)`
+        tornava 0 crides (cost=$0.00) tot i que el test havia gastat API.
+
+        Aquest test verifica que durant la crida a `judge_step`, el
+        context del thread és el `test_sid` que volem (no l'uuid del
+        baseline que `new_session_state` ha creat).
+        """
+        captured_sids = []
+
+        def capturing_judge(step, student, partials=None):
+            # Capturem el session_id ACTIU al moment de la crida.
+            _, current_sid = L.get_log_context()
+            captured_sids.append(current_sid)
+            return {
+                "verdict": "correct", "reason": "OK", "error_label": None,
+                "missing": None, "next_question": None,
+            }
+
+        L.set_log_context(student_id=None, session_id=None)  # reset
+        try:
+            with patch("llm.judge_step", side_effect=capturing_judge):
+                T.run_exhaustive_test("PROB-PAU-03", session_id="test_xyz_123")
+        finally:
+            L.set_log_context(student_id=None, session_id=None)
+
+        # PAU-03 té 1 pas free_text al pas 1 amb 4 inputs → 4 crides al
+        # mock. Els passos 2 i 3 són determinístics i NO criden judge_step
+        # per als inputs correctes. Tampoc per a inputs numèrics ben
+        # formats (0.045, etc.). Així que el comptador esperat és 4
+        # (els 4 inputs del pas 1 + avanç de baseline al final del pas 1).
+        # OJO: el primer input es processa DOS vegades — una per al match
+        # report i una per avançar el baseline. Per tant 4 + 1 = 5.
+        # Però només cal verificar que TOTS els sids capturats són
+        # `test_xyz_123` (no que en siguin 4 o 5 exactes).
+        self.assertGreater(len(captured_sids), 0,
+                           "judge_step mai s'ha cridat (el test no ha provat res)")
+        for sid in captured_sids:
+            self.assertEqual(sid, "test_xyz_123",
+                             f"Context perdut: {sid!r} en lloc de 'test_xyz_123'")
+
 
 if __name__ == "__main__":
     unittest.main()
