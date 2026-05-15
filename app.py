@@ -60,6 +60,7 @@ _UI = {
     "prereq_title":     "### 🔁 Exercici de reforç previ",
     "answer_label":     "La teva resposta:",
     "submit_btn":       "Enviar ↵",
+    "clear_btn_help":   "Buida la resposta",
     "solved":           "🎉 Problema completat! Has resolt el problema pas a pas.",
     "referred":         "Et recomanem parlar amb el professor o assistir a una tutoria.",
     "step_label":       "Pas {idx} de {total}",
@@ -74,6 +75,30 @@ _UI = {
 def _t(key: str) -> str:
     """Recupera un text d'interfície per clau. Sempre en català."""
     return _UI.get(key, key)
+
+
+# ============================================================
+# Snippets de notació matemàtica (Q1-Q4 del feature spec)
+# ============================================================
+# Botonera que apareix SOBRE el text_area dels passos `free_text`.
+# Cada tupla és (label_visual, snippet_inserit). El label és simbòlic
+# i universal; el snippet és el text que el `judge_step` ja entén
+# (`and`, `|`, `or`, `not`) — vegeu llm.py::_SYSTEM_JUDGE.
+#
+# El símbol `□` (U+25A1, WHITE SQUARE) és placeholder visual: indica
+# a l'alumne "omple aquí". No s'insereix res — només són els labels.
+#
+# Per què a `free_text` i no als altres `input_type`s: els passos
+# numèrics (decimal/fraction/integer) demanen un valor, no una
+# expressió. La notació `p(A|B)` només té sentit on l'alumne ha
+# d'escriure raonament en prosa amb expressions probabilístiques.
+NOTATION_SNIPPETS = [
+    ("p(□ ∩ □)", "p(  and  )"),
+    ("p(□ | □)", "p(  |  )"),
+    ("p(□)",     "p()"),
+    ("p(□ ∪ □)", "p(  or  )"),
+    ("P(Ā)",     "p(not )"),
+]
 
 
 # ============================================================
@@ -658,15 +683,87 @@ if step_idx < len(steps):
             display = cat_msg or reason or _t("wrong_msg")
             st.warning(display)
 
-    # Formulari del pas: només un botó d'envia. Sense `?`/`!!` ni
-    # discrepància — la UI accepta exclusivament text que respon al pas.
-    with st.form(key=f"step_form_{step_idx}_{st.session_state.input_counter}"):
-        answer = st.text_area(
+    # ====================================================================
+    # Bifurcació del render del pas segons `input_type`:
+    #
+    # - `free_text` → camí SENSE st.form: text_area amb `key` explícit
+    #   (perquè Streamlit sincronitzi el valor amb session_state a cada
+    #   interacció) + botonera de snippets de notació al damunt + botó
+    #   paperera + botó submit. Sortir del form és necessari perquè els
+    #   botons de snippet són `st.button` regulars, i un botó fora del
+    #   form que es clica DURANT l'edició PERDRIA el text si el text_area
+    #   estigués dins d'un form (els forms només commiten al submit).
+    #
+    # - integer / decimal / fraction / set_listing → camí AMB st.form
+    #   (com abans). Aquests passos demanen un valor, no una expressió,
+    #   així que no necessiten snippets de notació, i el form els dóna
+    #   suport a Cmd+Enter per enviar.
+    # ====================================================================
+    it = step.get("input_type", "free_text")
+    answer_key = f"answer_{step_idx}_{st.session_state.input_counter}"
+
+    if it == "free_text":
+        # Botonera de snippets de notació matemàtica. Cada botó fa
+        # `session_state[answer_key] += snippet` i un rerun. Streamlit
+        # accepta perfectament aquesta mutació perquè el text_area es
+        # renderitza DESPRÉS, llegint el valor actualitzat del state.
+        snip_cols = st.columns(len(NOTATION_SNIPPETS))
+        for i, (label, snippet) in enumerate(NOTATION_SNIPPETS):
+            with snip_cols[i]:
+                if st.button(
+                    label,
+                    key=f"snip_{i}_{step_idx}_{st.session_state.input_counter}",
+                    use_container_width=True,
+                ):
+                    current = st.session_state.get(answer_key, "")
+                    st.session_state[answer_key] = current + snippet
+                    st.rerun()
+
+        st.text_area(
             _t("answer_label"),
             height=100,
-            key=f"answer_{step_idx}_{st.session_state.input_counter}",
+            key=answer_key,
         )
-        submitted = st.form_submit_button(_t("submit_btn"))
+
+        # Fila d'accions: submit (gros, esquerra) + paperera (petita, dreta).
+        # Ratio 5:1 perquè la paperera no domini visualment — és una acció
+        # secundària. Confirmació no cal: si l'alumne s'equivoca, és tornar
+        # a escriure (o tornar a clicar snippets).
+        col_submit, col_clear = st.columns([5, 1])
+        with col_submit:
+            submitted = st.button(
+                _t("submit_btn"),
+                key=f"submit_{step_idx}_{st.session_state.input_counter}",
+                use_container_width=True,
+                type="primary",
+            )
+        with col_clear:
+            if st.button(
+                "🗑️",
+                key=f"clear_{step_idx}_{st.session_state.input_counter}",
+                help=_t("clear_btn_help"),
+                use_container_width=True,
+            ):
+                st.session_state[answer_key] = ""
+                st.rerun()
+
+        # El valor enviat NO es llegeix de la variable retornada per
+        # st.text_area (que en aquest patró sense form ja no s'usa),
+        # sinó del session_state on Streamlit l'ha sincronitzat.
+        answer = st.session_state.get(answer_key, "")
+
+    else:
+        # Camí clàssic per a passos amb input numèric o de conjunt.
+        # El form proporciona Cmd+Enter per a enviament, i com que
+        # aquests passos no requereixen snippets, l'aïllament del form
+        # no és un problema.
+        with st.form(key=f"step_form_{step_idx}_{st.session_state.input_counter}"):
+            answer = st.text_area(
+                _t("answer_label"),
+                height=100,
+                key=answer_key,
+            )
+            submitted = st.form_submit_button(_t("submit_btn"))
 
     if submitted and answer.strip():
         new_state = T.process_turn(state, answer)
